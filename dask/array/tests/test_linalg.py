@@ -624,6 +624,140 @@ def test_lu_errors():
     pytest.raises(ValueError, lambda: da.linalg.lu(dA))
 
 
+def _check_permutation_matrix(p):
+    assert set(np.unique(p)) <= {0.0, 1.0}
+    assert np.all(p.sum(axis=0) == 1)
+    assert np.all(p.sum(axis=1) == 1)
+
+
+def test_lu_panel_single_element_chunks():
+    # every diagonal block is singular, so pivoting has to reach
+    # across block boundaries
+    A = np.array([[0.0, 1.0], [1.0, 0.0]])
+    dA = da.from_array(A, chunks=(1, 1))
+    dp, dl, du = da.linalg.lu(dA, pivoting="panel")
+    _check_lu_result(dp, dl, du, A)
+
+    sp, sl, su = scipy.linalg.lu(A)
+    assert_eq(dp, sp, check_graph=False)
+    assert_eq(dl, sl, check_graph=False)
+    assert_eq(du, su, check_graph=False)
+
+
+def test_lu_panel_cross_block_swaps():
+    # the factorization requires cross-block row exchanges in two
+    # different panels
+    A = np.array(
+        [
+            [1.0, 1.0, 1.0, 1.0],
+            [10.0, 11.0, 10.0, 10.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 10.0, 11.0],
+        ]
+    )
+    expected_p = np.array(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    sp, sl, su = scipy.linalg.lu(A)
+    assert np.allclose(sp, expected_p)
+
+    for chunks in [(1, 1), (2, 2)]:
+        dA = da.from_array(A, chunks=chunks)
+        dp, dl, du = da.linalg.lu(dA, pivoting="panel")
+        _check_lu_result(dp, dl, du, A)
+        assert_eq(dp, expected_p, check_graph=False)
+        assert_eq(dl, sl, check_graph=False)
+        assert_eq(du, su, check_graph=False)
+
+
+@pytest.mark.parametrize("chunks", [(1, 2, 1), (2, 2, 1), (4, 1)])
+def test_lu_panel_uneven_chunks(chunks):
+    rng = np.random.default_rng(42)
+    A = rng.random((5, 5)) + 3 * np.eye(5)
+    A[0, 0] = 0  # force a row exchange in the first panel
+
+    dA = da.from_array(A, chunks=(chunks, chunks))
+    dp, dl, du = da.linalg.lu(dA, pivoting="panel")
+    _check_lu_result(dp, dl, du, A)
+    _check_permutation_matrix(dp.compute())
+
+
+def test_lu_panel_complex():
+    rng = np.random.default_rng(2)
+    A = rng.random((4, 4)) + 1j * rng.random((4, 4))
+    A[0, 0] = 0  # force a row exchange in the first panel
+
+    dA = da.from_array(A, chunks=(2, 2))
+    dp, dl, du = da.linalg.lu(dA, pivoting="panel")
+    _check_lu_result(dp, dl, du, A)
+
+    sp, sl, su = scipy.linalg.lu(A)
+    assert_eq(dp, sp, check_graph=False)
+    assert_eq(dl, sl, check_graph=False)
+    assert_eq(du, su, check_graph=False)
+
+
+def test_lu_panel_singular():
+    A = np.ones((4, 4))
+    dA = da.from_array(A, chunks=(2, 2))
+    dp, dl, du = da.linalg.lu(dA, pivoting="panel")
+    with pytest.raises(np.linalg.LinAlgError, match="singular"):
+        du.compute()
+
+
+def test_lu_panel_is_lazy(monkeypatch):
+    A = np.array([[0.0, 1.0], [1.0, 0.0]])
+    dA = da.from_array(A, chunks=(1, 1))
+
+    def _fail(self, **kwargs):
+        raise AssertionError("lu triggered a computation during graph construction")
+
+    monkeypatch.setattr(da.Array, "compute", _fail)
+    monkeypatch.setattr(da.Array, "persist", _fail)
+    da.linalg.lu(dA, pivoting="panel")
+
+
+def test_lu_panel_errors():
+    A = np.eye(4)
+    dA = da.from_array(A, chunks=((2, 2), (3, 1)))
+    with pytest.raises(ValueError, match="chunks must match"):
+        da.linalg.lu(dA, pivoting="panel")
+
+    dA = da.from_array(A, chunks=2)
+    with pytest.raises(ValueError, match="pivoting"):
+        da.linalg.lu(dA, pivoting="partial")
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.complex128])
+def test_solve_panel_pivoting(dtype):
+    A = np.array(
+        [
+            [1.0, 1.0, 1.0, 1.0],
+            [10.0, 11.0, 10.0, 10.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 10.0, 11.0],
+        ],
+        dtype=dtype,
+    )
+    dA = da.from_array(A, chunks=(1, 1))
+
+    b = np.arange(1.0, 5.0).astype(dtype)
+    db = da.from_array(b, chunks=1)
+    x = da.linalg.solve(dA, db, pivoting="panel")
+    assert_eq(x, scipy.linalg.solve(A, b))
+    assert_eq(dA.dot(x), b)
+
+    b2 = np.arange(8.0).reshape(4, 2).astype(dtype)
+    db2 = da.from_array(b2, chunks=(1, 1))
+    x2 = da.linalg.solve(dA, db2, pivoting="panel")
+    assert_eq(x2, scipy.linalg.solve(A, b2))
+
+
 @pytest.mark.parametrize(("shape", "chunk"), [(20, 10), (50, 10), (70, 20)])
 def test_solve_triangular_vector(shape, chunk):
     rng = np.random.default_rng(1)

@@ -975,9 +975,118 @@ def _solve_triangular_lower(a, b):
     return solve_triangular_safe(a, b, lower=True)
 
 
-def lu(a):
+def _lu_panel_factor(blocks, spans, block_col):
+    """Factor a stacked panel with partial pivoting via LAPACK ``getrf``.
+
+    Parameters
+    ----------
+    blocks : list of ndarray
+        The blocks of the current block column, stacked top to bottom.
+    spans : tuple of (start, stop)
+        Row span of each block within the panel, used to split the
+        resulting lower-triangular factor back into blocks.
+    block_col : int
+        Index of the block column being factored (for error messages).
+
+    Returns
+    -------
+    perm : ndarray
+        Index vector such that row ``i`` of the pivoted panel was row
+        ``perm[i]`` of the unpivoted panel.
+    lower_blocks : list of ndarray
+        Unit-lower-triangular factor of the panel, split per block.
+    upper : ndarray
+        Upper-triangular factor of the top block of the panel.
+    """
+    import scipy.linalg
+
+    panel = np.concatenate(blocks, axis=0)
+    (getrf,) = scipy.linalg.lapack.get_lapack_funcs(("getrf",), (panel,))
+    lu, piv, info = getrf(panel)
+    if info < 0:
+        raise ValueError(
+            f"LAPACK getrf failed with an illegal value in argument {-info} "
+            f"while factoring block column {block_col} of the LU decomposition"
+        )
+    if info > 0:
+        raise np.linalg.LinAlgError(
+            "Matrix is singular: exact zero encountered in column "
+            f"{spans[0][0] + info - 1} while factoring block column "
+            f"{block_col} of the LU decomposition"
+        )
+    ncols = lu.shape[1]
+    # LAPACK returns 1-based pivot indices while scipy >= 1.14 converts
+    # them to 0-based; disambiguate with a tiny probe factorization
+    _, probe_piv, _ = getrf(np.array([[0.0, 1.0], [1.0, 0.0]]))
+    if probe_piv[0] == 2:
+        piv = piv - 1
+    perm = np.arange(lu.shape[0])
+    for i, p in enumerate(piv):
+        if p != i:
+            perm[i], perm[p] = perm[p], perm[i]
+    lower = np.tril(lu, k=-1) + np.eye(lu.shape[0], ncols, dtype=lu.dtype)
+    offset = spans[0][0]
+    lower_blocks = [lower[start - offset : stop - offset] for start, stop in spans]
+    upper = np.triu(lu[:ncols])
+    return perm, lower_blocks, upper
+
+
+def _lu_apply_permutation(perm, blocks, spans):
+    """Apply a panel row permutation to blocks of another block column.
+
+    ``blocks`` spans the same matrix rows as the panel the permutation
+    was computed from; ``spans`` gives the global row span of each block.
+    Rows may move across block boundaries, so the blocks are stacked,
+    permuted as a whole and split again.
+    """
+    col = np.concatenate(blocks, axis=0)[perm]
+    offset = spans[0][0]
+    return [col[start - offset : stop - offset] for start, stop in spans]
+
+
+def _lu_update_perm(labels, perm, offset):
+    """Compose the running row-label vector with a panel permutation."""
+    labels = labels.copy()
+    labels[offset:] = labels[offset:][perm]
+    return labels
+
+
+def _lu_perm_block(nrows, labels, offset):
+    """Build one block of the permutation matrix ``P = I[:, labels]``.
+
+    The block covers the rows ``offset:offset + nrows`` and the columns
+    whose labels are given.
+    """
+    out = np.zeros((nrows, labels.shape[0]))
+    local = labels - offset
+    (cols,) = np.nonzero((local >= 0) & (local < nrows))
+    out[local[cols], cols] = 1.0
+    return out
+
+
+def lu(a, pivoting="diagonal"):
     """
     Compute the lu decomposition of a matrix.
+
+    Parameters
+    ----------
+    a : (M, M) Array
+        Square matrix to factorize.
+    pivoting : {"diagonal", "panel"}, optional
+        Pivoting strategy used during the factorization.
+
+        * ``"diagonal"`` (default) factorizes each diagonal block
+          independently and only applies row permutations within the
+          current block row. It requires all chunks to be square and of
+          equal size, and it may fail when a diagonal block is singular
+          even if the whole matrix is invertible.
+        * ``"panel"`` performs partial pivoting across block boundaries:
+          for every block column the pivot search covers all rows that
+          have not been eliminated yet, and the row exchanges are
+          propagated to the already computed ``L`` columns and to the
+          trailing matrix. Row and column chunks must match, but they
+          do not need to be uniform, so ragged tail chunks are
+          supported.
 
     Examples
     --------
@@ -991,14 +1100,37 @@ def lu(a):
     l:  Array, lower triangular matrix with unit diagonal.
     u:  Array, upper triangular matrix
     """
-    import scipy.linalg
-
     if a.ndim != 2:
         raise ValueError("Dimension must be 2 to perform lu decomposition")
 
     xdim, ydim = a.shape
     if xdim != ydim:
         raise ValueError("Input must be a square matrix to perform lu decomposition")
+
+    if pivoting == "diagonal":
+        if len(set(a.chunks[0] + a.chunks[1])) != 1:
+            msg = (
+                "All chunks must be a square matrix to perform lu decomposition. "
+                "Use .rechunk method to change the size of chunks."
+            )
+            raise ValueError(msg)
+        return _lu_diagonal(a)
+    elif pivoting == "panel":
+        if a.chunks[0] != a.chunks[1]:
+            msg = (
+                "Row and column chunks must match to perform lu decomposition "
+                "with pivoting='panel'. Use .rechunk method to change the size "
+                "of chunks."
+            )
+            raise ValueError(msg)
+        return _lu_panel(a)
+    else:
+        raise ValueError(f"pivoting must be 'diagonal' or 'panel', got {pivoting!r}")
+
+
+def _lu_diagonal(a):
+    import scipy.linalg
+
     if len(set(a.chunks[0] + a.chunks[1])) != 1:
         msg = (
             "All chunks must be a square matrix to perform lu decomposition. "
@@ -1111,6 +1243,141 @@ def lu(a):
     return p, l, u
 
 
+def _lu_panel(a):
+    """LU decomposition with partial pivoting across block boundaries.
+
+    The matrix is processed one block column (panel) at a time. Each
+    panel is factored with LAPACK's partial-pivoting ``getrf``, so the
+    pivot search covers every row that has not been eliminated yet. The
+    resulting row exchanges are propagated to the previously computed
+    ``L`` columns and to the trailing matrix before the factorization
+    continues. The running row permutation is tracked as a label vector
+    from which the permutation matrix ``P`` (with ``A = P @ L @ U``) is
+    assembled at the end.
+    """
+    import scipy.linalg
+
+    nb = len(a.chunks[0])
+    token = tokenize(a, "panel")
+
+    name_factor = f"lu-panel-factor-{token}"
+    name_apply = f"lu-panel-apply-{token}"
+    name_labels = f"lu-panel-labels-{token}"
+    name_p = f"lu-p-panel-{token}"
+    name_l = f"lu-l-panel-{token}"
+    name_u = f"lu-u-panel-{token}"
+
+    bounds = [0] + [int(b) for b in np.cumsum(a.chunks[0])]
+    spans = tuple((bounds[i], bounds[i + 1]) for i in range(nb))
+
+    dsk = {}
+    # working copy of the not-yet-eliminated (trailing) matrix
+    work = {(i, j): (a.name, i, j) for i in range(nb) for j in range(nb)}
+    lcols = {}  # (i, j) -> unit-lower-triangular block, i >= j
+    ublocks = {}  # (i, j) -> upper-triangular block, i <= j
+    labels = (np.arange, a.shape[0])
+
+    for k in range(nb):
+        panel_spans = spans[k:]
+        factor_key = (name_factor, k)
+        dsk[factor_key] = (
+            _lu_panel_factor,
+            [work[i, k] for i in range(k, nb)],
+            panel_spans,
+            k,
+        )
+        perm_k = (operator.getitem, factor_key, 0)
+
+        # propagate the row exchanges to the L columns computed so far ...
+        for j in range(k):
+            apply_key = (name_apply, k, j)
+            dsk[apply_key] = (
+                _lu_apply_permutation,
+                perm_k,
+                [lcols[i, j] for i in range(k, nb)],
+                panel_spans,
+            )
+            for idx, i in enumerate(range(k, nb)):
+                lcols[i, j] = (operator.getitem, apply_key, idx)
+        # ... and to the trailing matrix
+        for j in range(k + 1, nb):
+            apply_key = (name_apply, k, j)
+            dsk[apply_key] = (
+                _lu_apply_permutation,
+                perm_k,
+                [work[i, j] for i in range(k, nb)],
+                panel_spans,
+            )
+            for idx, i in enumerate(range(k, nb)):
+                work[i, j] = (operator.getitem, apply_key, idx)
+
+        # keep track of the global row permutation
+        labels_key = (name_labels, k)
+        dsk[labels_key] = (_lu_update_perm, labels, perm_k, spans[k][0])
+        labels = labels_key
+
+        # split the panel factors into blocks
+        lower_k = (operator.getitem, factor_key, 1)
+        for idx, i in enumerate(range(k, nb)):
+            lcols[i, k] = (operator.getitem, lower_k, idx)
+        ublocks[k, k] = (operator.getitem, factor_key, 2)
+
+        # solve for the remaining U blocks of this block row
+        for j in range(k + 1, nb):
+            ublocks[k, j] = (_solve_triangular_lower, lcols[k, k], work[k, j])
+
+        # rank update of the trailing matrix
+        for i in range(k + 1, nb):
+            for j in range(k + 1, nb):
+                work[i, j] = (
+                    operator.sub,
+                    work[i, j],
+                    (np.dot, lcols[i, k], ublocks[k, j]),
+                )
+
+    pp, ll, uu = scipy.linalg.lu(np.ones(shape=(1, 1), dtype=a.dtype))
+    for i in range(nb):
+        for j in range(nb):
+            dsk[name_p, i, j] = (
+                _lu_perm_block,
+                a.chunks[0][i],
+                (operator.getitem, labels, slice(spans[j][0], spans[j][1])),
+                spans[i][0],
+            )
+            if i > j:
+                dsk[name_l, i, j] = lcols[i, j]
+                dsk[name_u, i, j] = (
+                    np.zeros,
+                    (a.chunks[0][i], a.chunks[1][j]),
+                    uu.dtype,
+                )
+            elif i == j:
+                dsk[name_l, i, j] = lcols[i, i]
+                dsk[name_u, i, j] = ublocks[i, i]
+            else:
+                dsk[name_l, i, j] = (
+                    np.zeros,
+                    (a.chunks[0][i], a.chunks[1][j]),
+                    ll.dtype,
+                )
+                dsk[name_u, i, j] = ublocks[i, j]
+
+    pp_meta = meta_from_array(a, dtype=pp.dtype)
+    ll_meta = meta_from_array(a, dtype=ll.dtype)
+    uu_meta = meta_from_array(a, dtype=uu.dtype)
+
+    graph = HighLevelGraph.from_collections(name_p, dsk, dependencies=[a])
+    p = Array(graph, name_p, shape=a.shape, chunks=a.chunks, meta=pp_meta)
+
+    graph = HighLevelGraph.from_collections(name_l, dsk, dependencies=[a])
+    l = Array(graph, name_l, shape=a.shape, chunks=a.chunks, meta=ll_meta)
+
+    graph = HighLevelGraph.from_collections(name_u, dsk, dependencies=[a])
+    u = Array(graph, name_u, shape=a.shape, chunks=a.chunks, meta=uu_meta)
+
+    return p, l, u
+
+
 def solve_triangular(a, b, lower=False):
     """
     Solve the equation `a x = b` for `x`, assuming a is a triangular matrix.
@@ -1205,7 +1472,7 @@ def solve_triangular(a, b, lower=False):
     return Array(graph, name, shape=b.shape, chunks=b.chunks, meta=meta)
 
 
-def solve(a, b, sym_pos=None, assume_a="gen"):
+def solve(a, b, sym_pos=None, assume_a="gen", pivoting="diagonal"):
     """
     Solve the equation ``a x = b`` for ``x``. By default, use LU
     decomposition and forward / backward substitutions. When ``assume_a = "pos"``
@@ -1232,6 +1499,12 @@ def solve(a, b, sym_pos=None, assume_a="gen"):
         .. versionchanged:: 2022.8.0
             ``assume_a = 'pos'`` was previously defined as ``sym_pos = True``.
 
+    pivoting : {'diagonal', 'panel'}, optional
+        Pivoting strategy used by the LU decomposition when
+        ``assume_a = 'gen'``. See :func:`lu` for details. Use
+        ``pivoting = 'panel'`` when a diagonal block of ``a`` may be
+        singular even though ``a`` itself is invertible.
+
     Returns
     -------
     x : (M,) or (M, N) Array
@@ -1254,7 +1527,7 @@ def solve(a, b, sym_pos=None, assume_a="gen"):
     if assume_a == "pos":
         l, u = _cholesky(a)
     elif assume_a == "gen":
-        p, l, u = lu(a)
+        p, l, u = lu(a, pivoting=pivoting)
         b = p.T.dot(b)
     else:
         raise ValueError(
