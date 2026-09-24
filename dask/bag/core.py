@@ -1148,7 +1148,7 @@ class Bag(DaskMethodsMixin):
         """Standard deviation"""
         return self.var(ddof=ddof).apply(math.sqrt)
 
-    def join(self, other, on_self, on_other=None):
+    def join(self, other, on_self, on_other=None, how="inner", npartitions=None):
         """Joins collection with another collection.
 
         Other collection must be one of the following:
@@ -1159,7 +1159,10 @@ class Bag(DaskMethodsMixin):
             other collection is sizable and you're using the distributed
             scheduler.  Dask is able to pass around data wrapped in delayed
             objects with greater sophistication.
-        3.  A Bag with a single partition
+        3.  A Bag.  A single-partition Bag is broadcast to every partition of
+            this collection.  A multi-partition Bag triggers a hash shuffle of
+            both sides, so that records with equal keys are routed to the same
+            output partition before being joined locally.
 
         You might also consider Dask Dataframe, whose join operations are much
         more heavily optimized.
@@ -1174,6 +1177,15 @@ class Bag(DaskMethodsMixin):
         on_other: callable (defaults to on_self)
             Function to call on elements in the other collection to determine a
             match
+        how: {"inner", "left"}, optional
+            Type of join to perform.  With ``"inner"`` (the default) only
+            matching records are emitted.  With ``"left"`` every record of
+            this collection is emitted at least once; records without a match
+            are paired with ``None``.
+        npartitions: int, optional
+            Number of output partitions when joining two multi-partition
+            Bags.  Defaults to the larger partition count of the two inputs.
+            Ignored when ``other`` is not a multi-partition Bag.
 
         Examples
         --------
@@ -1182,36 +1194,57 @@ class Bag(DaskMethodsMixin):
         >>> fruit = ['Apple', 'Apricot', 'Banana']
         >>> list(people.join(fruit, lambda x: x[0]))
         [('Apple', 'Alice'), ('Apricot', 'Alice'), ('Banana', 'Bob')]
+
+        Two multi-partition bags can be joined directly.  Equal keys are
+        shuffled to the same partition, so duplicate keys produce all
+        combinations of matching records:
+
+        >>> left = db.from_sequence([1, 2, 3, 4], npartitions=2)
+        >>> right = db.from_sequence([2, 4, 6], npartitions=2)
+        >>> sorted(left.join(right, lambda x: x % 2, lambda x: x % 2))
+        [(2, 2), (2, 4), (4, 2), (4, 4), (6, 2), (6, 4)]
+
+        With ``how="left"`` records of the left collection without a match
+        are emitted exactly once, paired with ``None``:
+
+        >>> sorted(
+        ...     left.join(right, lambda x: x % 2, lambda x: x % 2, how="left"),
+        ...     key=str,
+        ... )
+        [(2, 2), (2, 4), (4, 2), (4, 4), (6, 2), (6, 4), (None, 1), (None, 3)]
         """
-        token = tokenize(self, other, on_self, on_other)
+        if how not in ("inner", "left"):
+            msg = f"how must be 'inner' or 'left', got {how!r}"
+            raise ValueError(msg)
+
+        if isinstance(other, Bag) and other.npartitions > 1:
+            if on_other is None:
+                on_other = on_self
+            return _join_shuffle(self, other, on_self, on_other, how, npartitions)
+
+        token = tokenize(self, other, on_self, on_other, how)
         name = f"join-{token}"
         dsk = {}
         if isinstance(other, Bag):
-            if other.npartitions == 1:
-                dsk.update(other.dask)
-                other = other.__dask_keys__()[0]
-                dsk[f"join-{name}-other"] = (list, other)
-            else:
-                msg = (
-                    "Multi-bag joins are not implemented. "
-                    "We recommend Dask dataframe if appropriate"
-                )
-                raise NotImplementedError(msg)
+            dsk.update(other.dask)
+            other = other.__dask_keys__()[0]
+            dsk[f"join-{name}-other"] = (list, other)
         elif isinstance(other, Delayed):
             dsk.update(other.dask)
             other = other._key
         elif not isinstance(other, Iterable):
             msg = (
-                "Joined argument must be single-partition Bag, "
-                f" delayed object, or Iterable, got {type(other).__name}"
+                "Joined argument must be a Bag, "
+                f" delayed object, or Iterable, got {type(other).__name__}"
             )
             raise TypeError(msg)
 
         if on_other is None:
             on_other = on_self
 
+        joiner = join if how == "inner" else partial(join, left_default=None)
         for i in range(self.npartitions):
-            dsk[(name, i)] = (list, (join, on_other, other, on_self, (self.name, i)))
+            dsk[(name, i)] = (list, (joiner, on_other, other, on_self, (self.name, i)))
 
         graph = HighLevelGraph.from_collections(name, dsk, dependencies=[self])
         return type(self)(graph, name, self.npartitions)
@@ -2379,6 +2412,102 @@ def make_group(k, stage):
         return x[0] // k**stage % k
 
     return h
+
+
+def _join_split_partition(keyfunc, data, npartitions, side):
+    """Split a partition into buckets by join key for a hash shuffle.
+
+    Returns a dict mapping bucket index to a list of ``(key, item)`` pairs.
+    Buckets are assigned with a deterministic hash so that equal keys from
+    either side of the join are routed to the same output partition, even
+    across processes.
+    """
+    buckets = defaultdict(list)
+    for item in data:
+        key = keyfunc(item)
+        try:
+            hash(key)
+        except TypeError:
+            raise TypeError(
+                "Join keys must be hashable, got unhashable key of type "
+                f"{type(key).__name__} on the {side} side of the join"
+            ) from None
+        buckets[int(tokenize(key), 16) % npartitions].append((key, item))
+    return dict(buckets)
+
+
+def _join_partition(left, right, how):
+    """Join two sequences of ``(key, item)`` pairs sharing the same keys.
+
+    Emits ``(right_item, left_item)`` pairs, matching the element order of
+    :meth:`Bag.join`.  With ``how="left"``, left items without a match are
+    emitted exactly once, paired with ``None``.
+    """
+    groups = defaultdict(list)
+    for key, item in right:
+        groups[key].append(item)
+    result = []
+    for key, item in left:
+        matches = groups.get(key)
+        if matches:
+            result.extend((other, item) for other in matches)
+        elif how == "left":
+            result.append((None, item))
+    return result
+
+
+def _join_shuffle(left, right, on_left, on_right, how, npartitions=None):
+    """Hash-shuffle join between two multi-partition bags.
+
+    Both sides are repartitioned by join key so that records with equal keys
+    land in the same output partition; the join then happens locally within
+    each output partition.  No data is collected on the client.
+    """
+    if npartitions is None:
+        npartitions = max(left.npartitions, right.npartitions)
+    elif npartitions < 1:
+        msg = f"npartitions must be a positive integer, got {npartitions}"
+        raise ValueError(msg)
+
+    token = tokenize(left, right, on_left, on_right, how, npartitions)
+    name = f"join-{token}"
+    dsk = {}
+    gathers = {}
+    for side, bag, keyfunc in (
+        ("left", left, on_left),
+        ("right", right, on_right),
+    ):
+        split_name = f"join-split-{side}-{token}"
+        gather_name = f"join-gather-{side}-{token}"
+        for i in range(bag.npartitions):
+            dsk[(split_name, i)] = (
+                _join_split_partition,
+                keyfunc,
+                (bag.name, i),
+                npartitions,
+                side,
+            )
+        for j in range(npartitions):
+            dsk[(gather_name, j)] = (
+                list,
+                (
+                    toolz.concat,
+                    [
+                        (dict.get, (split_name, i), j, [])
+                        for i in range(bag.npartitions)
+                    ],
+                ),
+            )
+        gathers[side] = gather_name
+
+    for j in range(npartitions):
+        dsk[(name, j)] = (
+            list,
+            (_join_partition, (gathers["left"], j), (gathers["right"], j), how),
+        )
+
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[left, right])
+    return type(left)(graph, name, npartitions)
 
 
 def groupby_tasks(b, grouper, hash=lambda x: int(tokenize(x), 16), max_branch=32):

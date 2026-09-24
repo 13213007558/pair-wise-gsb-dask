@@ -7,6 +7,7 @@ import random
 import warnings
 import weakref
 from bz2 import BZ2File
+from collections import Counter
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from itertools import repeat
 
 import partd
 import pytest
-from tlz import groupby, identity, join, merge, pluck, unique, valmap
+from tlz import first, groupby, identity, join, merge, pluck, unique, valmap
 
 import dask
 import dask.bag as db
@@ -446,6 +447,146 @@ def test_join(transform):
     assert_eq(c, list(join(iseven, [1, 2, 3], isodd, list(b))))
     assert_eq(b.join(other, isodd), list(join(isodd, [1, 2, 3], isodd, list(b))))
     assert c.name == b.join(other, on_self=isodd, on_other=iseven).name
+
+
+def test_join_left_broadcast():
+    c = b.join([1, 2, 3], on_self=isodd, on_other=iseven, how="left")
+    expected = list(join(iseven, [1, 2, 3], isodd, list(b), left_default=None))
+    assert Counter(c.compute()) == Counter(expected)
+    assert any(pair[0] is None for pair in c.compute())
+
+
+def test_join_invalid_how():
+    with pytest.raises(ValueError, match="how"):
+        b.join([1, 2, 3], isodd, how="outer")
+
+
+def test_join_multi_partition():
+    left = db.from_sequence([("a", 1), ("a", 2), ("b", 3)], npartitions=2)
+    right = db.from_sequence([("a", "x"), ("a", "y"), ("c", "z")], npartitions=2)
+    result = left.join(right, on_self=first, on_other=first)
+    # Two right records matching two left records produce four pairs
+    assert Counter(result.compute()) == Counter(
+        [
+            (("a", "x"), ("a", 1)),
+            (("a", "x"), ("a", 2)),
+            (("a", "y"), ("a", 1)),
+            (("a", "y"), ("a", 2)),
+        ]
+    )
+
+
+def test_join_multi_partition_left():
+    left = db.from_sequence([("a", 1), ("a", 2), ("b", 3)], npartitions=2)
+    right = db.from_sequence([("a", "x"), ("a", "y"), ("c", "z")], npartitions=2)
+    result = left.join(right, on_self=first, on_other=first, how="left")
+    assert Counter(result.compute()) == Counter(
+        [
+            (("a", "x"), ("a", 1)),
+            (("a", "x"), ("a", 2)),
+            (("a", "y"), ("a", 1)),
+            (("a", "y"), ("a", 2)),
+            (None, ("b", 3)),
+        ]
+    )
+
+
+@pytest.mark.parametrize("left_npartitions", [1, 2, 3, 7])
+@pytest.mark.parametrize("right_npartitions", [2, 5])
+def test_join_multi_partition_independent_of_partitioning(
+    left_npartitions, right_npartitions
+):
+    left_data = [(i % 4, ("l", i)) for i in range(11)]
+    right_data = [(i % 3, ("r", i)) for i in range(7)]
+    left = db.from_sequence(left_data, npartitions=left_npartitions)
+    right = db.from_sequence(right_data, npartitions=right_npartitions)
+    result = left.join(right, on_self=first, on_other=first)
+    expected = [
+        (r, l) for l in left_data for r in right_data if l[0] == r[0]
+    ]
+    assert Counter(result.compute()) == Counter(expected)
+
+
+def test_join_multi_partition_empty_partitions():
+    left = db.from_sequence(
+        [("a", 1), ("b", 2), ("c", 3), ("d", 4)], npartitions=4
+    )
+    right = db.from_sequence([("b", "x"), ("c", "y"), ("d", "z")], npartitions=3)
+    # Empty out one partition on each side
+    left = left.filter(lambda x: x[0] != "c")
+    right = right.filter(lambda x: x[0] != "b")
+    assert left.npartitions == 4
+    assert right.npartitions == 3
+
+    result = left.join(right, on_self=first, on_other=first)
+    assert Counter(result.compute()) == Counter([(("d", "z"), ("d", 4))])
+
+    result = left.join(right, on_self=first, on_other=first, how="left")
+    assert Counter(result.compute()) == Counter(
+        [
+            (None, ("a", 1)),
+            (None, ("b", 2)),
+            (("d", "z"), ("d", 4)),
+        ]
+    )
+
+
+def test_join_multi_partition_empty_side():
+    left = db.from_sequence([("a", 1), ("b", 2)], npartitions=2)
+    right = db.from_sequence([("a", "x"), ("b", "y")], npartitions=2).filter(
+        lambda x: False
+    )
+    assert right.npartitions == 2
+
+    result = left.join(right, on_self=first, on_other=first)
+    assert list(result.compute()) == []
+
+    result = left.join(right, on_self=first, on_other=first, how="left")
+    assert Counter(result.compute()) == Counter(
+        [(None, ("a", 1)), (None, ("b", 2))]
+    )
+
+
+def test_join_multi_partition_unhashable_key():
+    left = db.from_sequence([[1], [2]], npartitions=2)
+    right = db.from_sequence([1, 2], npartitions=2)
+
+    result = left.join(right, on_self=identity, on_other=identity)
+    with pytest.raises(TypeError, match="left side"):
+        result.compute()
+
+    result = right.join(left, on_self=identity, on_other=identity)
+    with pytest.raises(TypeError, match="right side"):
+        result.compute()
+
+
+def test_join_multi_partition_npartitions():
+    left = db.from_sequence(range(10), npartitions=2)
+    right = db.from_sequence(range(10), npartitions=3)
+
+    result = left.join(right, on_self=identity, npartitions=5)
+    assert result.npartitions == 5
+    assert Counter(result.compute()) == Counter((i, i) for i in range(10))
+
+    assert left.join(right, on_self=identity).npartitions == 3
+
+    with pytest.raises(ValueError, match="npartitions"):
+        left.join(right, on_self=identity, npartitions=0)
+
+
+def test_join_multi_partition_is_lazy():
+    calls = []
+
+    def keyfunc(x):
+        calls.append(x)
+        return x
+
+    left = db.from_sequence(range(6), npartitions=3)
+    right = db.from_sequence(range(6), npartitions=2)
+    result = left.join(right, on_self=keyfunc, on_other=keyfunc)
+    # Defining the join must not compute any records on the client
+    assert calls == []
+    assert Counter(result.compute()) == Counter((i, i) for i in range(6))
 
 
 def test_foldby():
