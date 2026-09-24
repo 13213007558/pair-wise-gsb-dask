@@ -207,6 +207,7 @@ __all__ = [
     "ravel_multi_index",
     "result_type",
     "roll",
+    "rolling_quantile",
     "rot90",
     "round",
     "searchsorted",
@@ -445,6 +446,7 @@ try:
         var,
     )
     from dask.array.reshape import reshape, reshape_blockwise
+    from dask.array.rolling import rolling_quantile
     from dask.array.routines import (
         allclose,
         append,
