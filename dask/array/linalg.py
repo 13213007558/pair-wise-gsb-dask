@@ -975,9 +975,231 @@ def _solve_triangular_lower(a, b):
     return solve_triangular_safe(a, b, lower=True)
 
 
-def lu(a):
+def _lu_factor_panel(panel, panel_index):
+    """LU-factor a stacked panel and raise a locatable error if singular."""
+    import scipy.linalg
+
+    p, l, u = scipy.linalg.lu(panel)
+    zero_pivots = np.nonzero(np.diag(u) == 0)[0]
+    if len(zero_pivots):
+        raise np.linalg.LinAlgError(
+            "Matrix is singular: encountered a zero pivot at column "
+            f"{zero_pivots[0]} of panel {panel_index} during the blocked "
+            "LU decomposition"
+        )
+    return p, l, u
+
+
+def _lu_update_permutation(perm, p_panel, offset):
+    """Apply a panel permutation to the global row permutation vector."""
+    # p_panel is the permutation matrix returned by scipy.linalg.lu, so
+    # p_panel.T @ x == x[indices]
+    indices = np.argmax(p_panel, axis=0)
+    perm = perm.copy()
+    perm[offset:] = perm[offset:][indices]
+    return perm
+
+
+def _lu_permutation_block(perm, row_start, row_stop, col_start, col_stop, dtype):
+    """Materialize one block of the global permutation matrix."""
+    out = np.zeros((row_stop - row_start, col_stop - col_start), dtype=dtype)
+    cols = perm[col_start:col_stop]
+    (local,) = np.nonzero((cols >= row_start) & (cols < row_stop))
+    out[cols[local] - row_start, local] = 1
+    return out
+
+
+def _lu_partial_pivoting(a):
+    """Blocked LU decomposition with partial pivoting across blocks.
+
+    Every panel is factored with a pivot search that spans all rows that
+    have not been eliminated yet. The resulting row exchanges are
+    propagated to the already computed L columns and to the remaining
+    columns of A, so the returned factors follow the usual convention
+    'a == p @ l @ u' with a global permutation matrix 'p'.
+    """
+    import scipy.linalg
+
+    chunks = a.chunks[0]
+    nblocks = len(chunks)
+    offsets = np.cumsum((0,) + chunks)
+
+    token = tokenize(a)
+    name_panel = f"lu-panel-{token}"
+    name_plu = f"lu-plu-{token}"
+    name_p_panel = f"lu-p-panel-{token}"
+    name_l_panel = f"lu-l-panel-{token}"
+    name_p_inv = f"lu-p-inv-{token}"
+    name_l_block = f"lu-l-block-{token}"
+    name_a_perm = f"lu-a-perm-{token}"
+    name_l_perm = f"lu-l-perm-{token}"
+    name_stack = f"lu-stack-{token}"
+    name_applied = f"lu-applied-{token}"
+    name_t = f"lu-t-{token}"
+    name_dot = f"lu-dot-{token}"
+    name_perm = f"lu-perm-{token}"
+
+    name_p = f"lu-p-{token}"
+    name_l = f"lu-l-{token}"
+    name_u = f"lu-u-{token}"
+
+    def a_key(k, j, step):
+        # Key of A block (k, j) with the row permutations of panels
+        # 0..step applied. Panel 'step' creates these for k >= step, j > step.
+        if step < 0:
+            return (a.name, k, j)
+        return (name_a_perm, step, k, j)
+
+    def l_key(k, p, step):
+        # Key of L block (k, p) with the row permutations of panels
+        # p + 1..step applied. Panel 'step' creates these for p < step <= k.
+        if step == p:
+            return (name_l_block, p, k)
+        return (name_l_perm, step, k, p)
+
+    def panel_slice(k, i):
+        return (
+            slice(int(offsets[k] - offsets[i]), int(offsets[k + 1] - offsets[i])),
+            slice(None),
+        )
+
+    dsk = {}
+    for i in range(nblocks):
+        # Factor the panel: the updated column block i stacked over all
+        # row blocks that are not eliminated yet
+        panel_inputs = []
+        for k in range(i, nblocks):
+            target = a_key(k, i, i - 1)
+            if i > 0:
+                prevs = []
+                for p in range(i):
+                    prev = name_dot, "panel", k, p, i
+                    dsk[prev] = (np.dot, l_key(k, p, i - 1), (name_u, p, i))
+                    prevs.append(prev)
+                target = name_t, i, k
+                dsk[target] = (operator.sub, a_key(k, i, i - 1), (sum, prevs))
+            panel_inputs.append(target)
+        dsk[name_panel, i] = (np.concatenate, panel_inputs, 0)
+        dsk[name_plu, i] = (_lu_factor_panel, (name_panel, i), i)
+        dsk[name_p_panel, i] = (operator.getitem, (name_plu, i), 0)
+        dsk[name_l_panel, i] = (operator.getitem, (name_plu, i), 1)
+        dsk[name_u, i, i] = (operator.getitem, (name_plu, i), 2)
+        # transposed permutation matrix is equal to its inverse
+        dsk[name_p_inv, i] = (np.transpose, (name_p_panel, i))
+
+        # Split the panel's L into blocks; its rows are already permuted
+        for k in range(i, nblocks):
+            dsk[name_l_block, i, k] = (
+                operator.getitem,
+                (name_l_panel, i),
+                panel_slice(k, i),
+            )
+
+        # Propagate the row exchanges of this panel to the already formed
+        # L columns and to the columns of A that are not eliminated yet
+        for p in range(i):
+            stack = name_stack, "l", i, p
+            dsk[stack] = (
+                np.concatenate,
+                [l_key(k, p, i - 1) for k in range(i, nblocks)],
+                0,
+            )
+            applied = name_applied, "l", i, p
+            dsk[applied] = (np.dot, (name_p_inv, i), stack)
+            for k in range(i, nblocks):
+                dsk[name_l_perm, i, k, p] = (operator.getitem, applied, panel_slice(k, i))
+        for j in range(i + 1, nblocks):
+            stack = name_stack, "a", i, j
+            dsk[stack] = (
+                np.concatenate,
+                [a_key(k, j, i - 1) for k in range(i, nblocks)],
+                0,
+            )
+            applied = name_applied, "a", i, j
+            dsk[applied] = (np.dot, (name_p_inv, i), stack)
+            for k in range(i, nblocks):
+                dsk[name_a_perm, i, k, j] = (operator.getitem, applied, panel_slice(k, i))
+
+        # Sweep to horizontal: U[i, j] for j > i, computed from the
+        # permuted A and L blocks of row block i
+        for j in range(i + 1, nblocks):
+            target = a_key(i, j, i)
+            if i > 0:
+                prevs = []
+                for p in range(i):
+                    prev = name_dot, "sweep", i, p, j
+                    dsk[prev] = (np.dot, l_key(i, p, i), (name_u, p, j))
+                    prevs.append(prev)
+                target = (operator.sub, target, (sum, prevs))
+            dsk[name_u, i, j] = (_solve_triangular_lower, (name_l_block, i, i), target)
+
+        # Accumulate the global row permutation
+        if i == 0:
+            dsk[name_perm, -1] = (np.arange, a.shape[0])
+        dsk[name_perm, i] = (
+            _lu_update_permutation,
+            (name_perm, i - 1),
+            (name_p_panel, i),
+            int(offsets[i]),
+        )
+
+    pp, ll, uu = scipy.linalg.lu(np.ones(shape=(1, 1), dtype=a.dtype))
+
+    # Assemble the final P, L and U block matrices
+    for i in range(nblocks):
+        for j in range(nblocks):
+            dsk[name_p, i, j] = (
+                _lu_permutation_block,
+                (name_perm, nblocks - 1),
+                int(offsets[i]),
+                int(offsets[i + 1]),
+                int(offsets[j]),
+                int(offsets[j + 1]),
+                pp.dtype,
+            )
+            if i < j:
+                dsk[name_l, i, j] = (np.zeros, (chunks[i], chunks[j]), ll.dtype)
+            elif i == j:
+                dsk[name_l, i, j] = (name_l_block, i, i)
+            else:
+                # last permutation touching row block i happens at panel i
+                dsk[name_l, i, j] = l_key(i, j, i)
+            if i > j:
+                dsk[name_u, i, j] = (np.zeros, (chunks[i], chunks[j]), uu.dtype)
+
+    ll_meta = meta_from_array(a, dtype=ll.dtype)
+    # the permutation matrix is real even for complex input
+    pp_meta = ll_meta.real
+    uu_meta = meta_from_array(a, dtype=uu.dtype)
+
+    graph = HighLevelGraph.from_collections(name_p, dsk, dependencies=[a])
+    p = Array(graph, name_p, shape=a.shape, chunks=a.chunks, meta=pp_meta)
+
+    graph = HighLevelGraph.from_collections(name_l, dsk, dependencies=[a])
+    l = Array(graph, name_l, shape=a.shape, chunks=a.chunks, meta=ll_meta)
+
+    graph = HighLevelGraph.from_collections(name_u, dsk, dependencies=[a])
+    u = Array(graph, name_u, shape=a.shape, chunks=a.chunks, meta=uu_meta)
+
+    return p, l, u
+
+
+def lu(a, pivoting="diagonal"):
     """
     Compute the lu decomposition of a matrix.
+
+    Parameters
+    ----------
+    a : (M, M) array_like
+        Square matrix to factorize.
+    pivoting : {"diagonal", "partial"}, optional
+        Pivoting strategy. With "diagonal" (default), row exchanges are
+        only searched within the current diagonal block, which requires
+        all chunks to be square and of equal size. With "partial", the
+        pivot search of each panel spans all rows that are not eliminated
+        yet, so a nonsingular matrix is factored correctly even when a
+        diagonal block is singular. "partial" requires the same chunks
+        along both axes, but the chunk sizes may be non-uniform.
 
     Examples
     --------
@@ -999,6 +1221,16 @@ def lu(a):
     xdim, ydim = a.shape
     if xdim != ydim:
         raise ValueError("Input must be a square matrix to perform lu decomposition")
+    if pivoting not in ("diagonal", "partial"):
+        raise ValueError(f"Unknown pivoting mode {pivoting!r}; expected 'diagonal' or 'partial'")
+    if pivoting == "partial":
+        if a.chunks[0] != a.chunks[1]:
+            raise ValueError(
+                "LU decomposition with partial pivoting requires the same "
+                "chunks along both axes. Use .rechunk method to change the "
+                "size of chunks."
+            )
+        return _lu_partial_pivoting(a)
     if len(set(a.chunks[0] + a.chunks[1])) != 1:
         msg = (
             "All chunks must be a square matrix to perform lu decomposition. "
@@ -1205,7 +1437,7 @@ def solve_triangular(a, b, lower=False):
     return Array(graph, name, shape=b.shape, chunks=b.chunks, meta=meta)
 
 
-def solve(a, b, sym_pos=None, assume_a="gen"):
+def solve(a, b, sym_pos=None, assume_a="gen", pivoting="diagonal"):
     """
     Solve the equation ``a x = b`` for ``x``. By default, use LU
     decomposition and forward / backward substitutions. When ``assume_a = "pos"``
@@ -1232,6 +1464,10 @@ def solve(a, b, sym_pos=None, assume_a="gen"):
         .. versionchanged:: 2022.8.0
             ``assume_a = 'pos'`` was previously defined as ``sym_pos = True``.
 
+    pivoting : {'diagonal', 'partial'}, optional
+        Pivoting strategy of the LU decomposition used when
+        ``assume_a = 'gen'``. See :func:`lu` for details.
+
     Returns
     -------
     x : (M,) or (M, N) Array
@@ -1254,7 +1490,7 @@ def solve(a, b, sym_pos=None, assume_a="gen"):
     if assume_a == "pos":
         l, u = _cholesky(a)
     elif assume_a == "gen":
-        p, l, u = lu(a)
+        p, l, u = lu(a, pivoting=pivoting)
         b = p.T.dot(b)
     else:
         raise ValueError(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 
 pytest.importorskip("numpy")
@@ -622,6 +624,113 @@ def test_lu_errors():
     A = rng.integers(0, 11, (20, 20))
     dA = da.from_array(A, chunks=(5, 4))
     pytest.raises(ValueError, lambda: da.linalg.lu(dA))
+
+
+def _cross_block_swap_matrix():
+    # After the first panel is eliminated, the rows of the second diagonal
+    # block are zero in the second panel's columns, so the second panel can
+    # only be factored by swapping rows in from the third block.
+    return np.array(
+        [
+            [1, 0, 1, 0, 0, 0],
+            [0, 1, 0, 1, 0, 0],
+            [1, 0, 1, 0, 1, 0],
+            [0, 1, 0, 1, 0, 1],
+            [0, 0, 1, 0, 1, 0],
+            [0, 0, 0, 1, 0, 1],
+        ],
+        dtype=float,
+    )
+
+
+def test_lu_partial_pivoting_singular_diagonal_block():
+    # the matrix is invertible but every diagonal block is singular
+    A = np.array([[0, 1], [1, 0]])
+    dA = da.from_array(A, chunks=(1, 1))
+    dp, dl, du = da.linalg.lu(dA, pivoting="partial")
+    p, l, u = scipy.linalg.lu(A)
+    assert_eq(dp, p, check_graph=False)
+    assert_eq(dl, l, check_graph=False)
+    assert_eq(du, u, check_graph=False)
+    _check_lu_result(dp, dl, du, A)
+
+
+def test_lu_partial_pivoting_second_round_swap():
+    A = _cross_block_swap_matrix()
+    dA = da.from_array(A, chunks=(2, 2))
+    dp, dl, du = da.linalg.lu(dA, pivoting="partial")
+    _check_lu_result(dp, dl, du, A)
+
+    # the second panel swaps the rows of the third block into the second
+    expected_p = np.zeros((6, 6))
+    expected_p[0, 0] = expected_p[1, 1] = 1
+    expected_p[4, 2] = expected_p[5, 3] = 1
+    expected_p[2, 4] = expected_p[3, 5] = 1
+    assert_eq(dp, expected_p, check_graph=False)
+
+    p = dp.compute()
+    assert set(np.unique(p)) <= {0.0, 1.0}
+    assert (p.sum(axis=0) == 1).all()
+    assert (p.sum(axis=1) == 1).all()
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.complex128])
+def test_lu_partial_pivoting_uneven_chunks(dtype):
+    rng = np.random.default_rng(42)
+    a = rng.standard_normal((7, 7))
+    if dtype == np.complex128:
+        a = a + 1j * rng.standard_normal((7, 7))
+        A = a @ a.conj().T + 7 * np.eye(7)
+    else:
+        A = a @ a.T + 7 * np.eye(7)
+    A = A.astype(dtype)
+    dA = da.from_array(A, chunks=((3, 3, 1), (3, 3, 1)))
+    dp, dl, du = da.linalg.lu(dA, pivoting="partial")
+    # the uneven tail chunks are preserved; nothing is rechunked into
+    # a single block
+    assert dp.chunks == dl.chunks == du.chunks == dA.chunks
+    p, l, u = da.compute(dp, dl, du)
+    assert np.allclose(p @ l @ u, A)
+    # check triangulars (in numpy: da.tril/da.triu lose complex metas)
+    assert np.allclose(l, np.tril(l))
+    assert np.allclose(u, np.triu(u))
+
+
+def test_lu_partial_pivoting_singular():
+    A = np.array([[1.0, 2.0], [2.0, 4.0]])
+    dA = da.from_array(A, chunks=(1, 1))
+    dp, dl, du = da.linalg.lu(dA, pivoting="partial")
+    with pytest.raises(np.linalg.LinAlgError, match="singular.*panel 1"):
+        da.compute(dp, dl, du)
+
+
+def test_lu_partial_pivoting_errors():
+    A = np.eye(4)
+    dA = da.from_array(A, chunks=((2, 2), (4,)))
+    with pytest.raises(ValueError, match="same chunks"):
+        da.linalg.lu(dA, pivoting="partial")
+    with pytest.raises(ValueError, match="Unknown pivoting"):
+        da.linalg.lu(dA, pivoting="unknown")
+
+
+def test_lu_partial_pivoting_lazy():
+    # building the graph must not trigger any computation
+    A = np.array([[0, 1], [1, 0]])
+    dA = da.from_array(A, chunks=(1, 1))
+    with (
+        mock.patch.object(da.Array, "compute", side_effect=AssertionError),
+        mock.patch.object(da.Array, "persist", side_effect=AssertionError),
+    ):
+        da.linalg.lu(dA, pivoting="partial")
+
+
+def test_solve_lu_partial_pivoting():
+    A = _cross_block_swap_matrix()
+    b = np.arange(1, 7, dtype=float)
+    dA = da.from_array(A, chunks=(2, 2))
+    db = da.from_array(b, chunks=2)
+    x = da.linalg.solve(dA, db, pivoting="partial")
+    assert_eq(x, np.linalg.solve(A, b), check_graph=False)
 
 
 @pytest.mark.parametrize(("shape", "chunk"), [(20, 10), (50, 10), (70, 20)])
