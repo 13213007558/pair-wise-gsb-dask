@@ -1344,7 +1344,7 @@ def cumprod(x, axis=None, dtype=None, out=None, method="sequential"):
     )
 
 
-def topk(a, k, axis=-1, split_every=None):
+def topk(a, k, axis=-1, split_every=None, stable=False):
     """Extract the k largest elements from a on the given axis,
     and return them sorted from largest to smallest.
     If k is negative, extract the -k smallest elements instead,
@@ -1365,6 +1365,15 @@ def topk(a, k, axis=-1, split_every=None):
         prevents getting the whole or a significant portion of the input array
         in memory all at once, with a negative impact on network transfer
         too when running on distributed.
+    stable: bool, optional
+        If True, ties between equal values are broken by the original
+        position along the axis, consistently with
+        :func:`argtopk` called with the same arguments, so that
+        ``topk`` and ``argtopk`` always point to the same elements
+        regardless of chunking and ``split_every``. Note that this does
+        not change the returned values, which are always the k largest
+        (or smallest, for negative k) elements; it only affects which
+        indices ``argtopk`` returns for tied elements.
 
     Returns
     -------

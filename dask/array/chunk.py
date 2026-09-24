@@ -235,7 +235,7 @@ def argtopk(a_plus_idx, k, axis, keepdims):
         a, idx = a_plus_idx
 
     if abs(k) >= a.shape[axis]:
-        return a_plus_idx
+        return a, idx
 
     idx2 = np.argpartition(a, -k, axis=axis)
     k_slice = slice(-k, None) if k > 0 else slice(-k)
@@ -263,6 +263,138 @@ def argtopk_aggregate(a_plus_idx, k, axis, keepdims):
             slice(None, None, -1) if i == axis else slice(None) for i in range(idx.ndim)
         )
     ]
+
+
+def _topk_gt_mask(a, v):
+    """Boolean mask of the elements of a that sort strictly after v.
+
+    Follows np.sort semantics: NaN is greater than any non-NaN value
+    (including +inf), and -0.0 compares equal to +0.0. Complex values
+    are ordered lexicographically by (real, imag), as in numpy.
+    """
+    if np.issubdtype(a.dtype, np.complexfloating):
+        eq_real = _topk_eq_mask(a.real, v.real)
+        return _topk_gt_mask(a.real, v.real) | (eq_real & _topk_gt_mask(a.imag, v.imag))
+    if np.issubdtype(a.dtype, np.inexact):
+        return (a > v) | (np.isnan(a) & ~np.isnan(v))
+    return a > v
+
+
+def _topk_eq_mask(a, v):
+    """Boolean mask of the elements of a that compare equal to v.
+
+    Follows np.sort semantics: NaN compares equal to NaN and
+    -0.0 compares equal to +0.0.
+    """
+    if np.issubdtype(a.dtype, np.complexfloating):
+        return _topk_eq_mask(a.real, v.real) & _topk_eq_mask(a.imag, v.imag)
+    if np.issubdtype(a.dtype, np.inexact):
+        return (a == v) | (np.isnan(a) & np.isnan(v))
+    return a == v
+
+
+def _argtopk_stable_select(a, idx, k, axis):
+    """Deterministically select the top-k candidates of a single node.
+
+    Select the abs(k) largest (smallest, for negative k) elements of a along
+    the given axis. Ties are broken by original position: among equal
+    values, the elements with the smallest original indices win. Both the
+    input and the output are sorted by ascending original index along the
+    axis, so applying this function recursively over a tree reduction
+    yields a result that does not depend on chunking or split_every.
+
+    The selection runs in O(n) time per node (np.partition plus a
+    compaction step); the number of candidates carried over to the next
+    step of the reduction is bounded by abs(k).
+    """
+    ka = abs(k)
+    n = a.shape[axis]
+    if ka >= n:
+        # Input is already sorted by ascending original index
+        return a, idx
+    if ka == 0:
+        empty = tuple(slice(0) if i == axis else slice(None) for i in range(a.ndim))
+        return a[empty], idx[empty]
+
+    # Threshold value: the ka-th best element in np.sort order
+    kth = n - ka if k > 0 else ka - 1
+    v = np.partition(a, kth, axis=axis)[
+        tuple(slice(kth, kth + 1) if i == axis else slice(None) for i in range(a.ndim))
+    ]
+
+    greater = _topk_gt_mask(a, v)
+    equal = _topk_eq_mask(a, v)
+    # Elements that are strictly better than the threshold are always
+    # selected; the remaining (ka - count) slots are filled by the tied
+    # elements with the smallest original indices, i.e. the first ones
+    # along the axis, as the input is sorted by original index.
+    better = greater if k > 0 else ~(greater | equal)
+    n_keep = ka - better.sum(axis=axis, keepdims=True)
+    tie_rank = equal.cumsum(axis=axis)
+    keep = better | (equal & (tie_rank <= n_keep))
+
+    # Compact the selected elements, preserving ascending original index
+    # order. Selected elements have unique ranks 1..ka, so this is a
+    # O(n) partition plus a O(ka log ka) sort - never a full-axis sort.
+    rank = np.where(keep, keep.cumsum(axis=axis), n)
+    cand = np.argpartition(rank, ka - 1, axis=axis)[
+        tuple(slice(ka) if i == axis else slice(None) for i in range(a.ndim))
+    ]
+    order = np.argsort(np.take_along_axis(rank, cand, axis), axis=axis)
+    order = np.take_along_axis(cand, order, axis)
+    return np.take_along_axis(a, order, axis), np.take_along_axis(idx, order, axis)
+
+
+def argtopk_stable(a_plus_idx, k, axis, keepdims):
+    """Chunk and combine function of argtopk with stable tie-breaking
+
+    Like argtopk, but ties between equal values are deterministically
+    broken by the original position along the axis: among equal values,
+    the elements with the smallest original indices are selected. This
+    rule is applied at every step of the tree reduction, so the final
+    result does not depend on chunking or split_every.
+    Note that, unlike in the parent function, the returned elements
+    are not sorted internally.
+    """
+    assert keepdims is True
+    axis = axis[0]
+
+    if isinstance(a_plus_idx, list):
+        a_plus_idx = list(flatten(a_plus_idx))
+        a = np.concatenate([ai for ai, _ in a_plus_idx], axis)
+        idx = np.concatenate(
+            [np.broadcast_to(idxi, ai.shape) for ai, idxi in a_plus_idx], axis
+        )
+    else:
+        a, idx = a_plus_idx
+
+    return _argtopk_stable_select(a, idx, k, axis)
+
+
+def argtopk_aggregate_stable(a_plus_idx, k, axis, keepdims):
+    """Final aggregation function of argtopk with stable tie-breaking
+
+    Invoke argtopk_stable one final time, sort the results by value
+    (breaking ties by ascending original index), drop the data and return
+    the index only.
+    """
+    assert keepdims is True
+    a_plus_idx = a_plus_idx if len(a_plus_idx) > 1 else a_plus_idx[0]
+    a, idx = argtopk_stable(a_plus_idx, k, axis, keepdims)
+    axis = axis[0]
+
+    if k < 0:
+        # Sort by ascending value; the stable sort keeps tied elements in
+        # ascending original index order.
+        idx2 = np.argsort(a, axis=axis, kind="stable")
+        return np.take_along_axis(idx, idx2, axis)
+    # Sort by descending value with ties in ascending original index order:
+    # stably sort the index-reversed input by ascending value, then reverse.
+    rev = tuple(
+        slice(None, None, -1) if i == axis else slice(None) for i in range(a.ndim)
+    )
+    idx2 = np.argsort(a[rev], axis=axis, kind="stable")[rev]
+    return np.take_along_axis(idx[rev], idx2, axis)
 
 
 def arange(start, stop, step, length, dtype, like=None):
