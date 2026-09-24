@@ -20,8 +20,10 @@ from dask.array import chunk
 from dask.array.core import (
     Array,
     _concatenate2,
+    asanyarray,
     handle_out,
     implements,
+    unify_chunks,
     unknown_chunk_message,
 )
 from dask.array.creation import arange, diagonal
@@ -1342,6 +1344,305 @@ def cumprod(x, axis=None, dtype=None, out=None, method="sequential"):
         method=method,
         preop=np.prod,
     )
+
+
+def _segmented_cumsum_block(x, reset, carry, axis, dtype):
+    """Segmented cumsum of a single block
+
+    At every position along `axis` the accumulator is first reset to zero
+    where `reset` is True, then the current value is added.  `carry` is the
+    accumulator incoming from the previous block (an array with a length-1
+    dimension along `axis`) or None for the first block.
+    """
+    out = np.cumsum(x, axis=axis, dtype=dtype)
+    n = x.shape[axis]
+    if n == 0:
+        return out
+    shape = [1] * x.ndim
+    shape[axis] = n
+    # idx[i] is the position of the most recent reset at or before i (-1 if none)
+    idx = np.where(reset, np.arange(n).reshape(shape), -1)
+    np.maximum.accumulate(idx, axis=axis, out=idx)
+    # The segment starting at s contributes cumsum[i] - cumsum[s - 1]
+    base = np.take_along_axis(out, np.clip(idx - 1, 0, None), axis=axis)
+    out = out - np.where(idx >= 1, base, 0)
+    if carry is not None:
+        # The incoming carry only reaches positions before the first reset
+        out = out + np.where(idx == -1, carry, 0)
+    return out
+
+
+def _segmented_cumsum_tail(x, reset, axis, dtype):
+    """Summary of a block: the sum of its trailing segment
+
+    This is the sum of all values after (and including) the last reset, or the
+    sum of the whole block if it contains no reset.  Empty blocks map to the
+    identity element zero.
+    """
+    if x.shape[axis] == 0:
+        shape = x.shape[:axis] + (1,) + x.shape[axis + 1 :]
+        return np.zeros(shape, dtype=dtype)
+    slc = (slice(None),) * axis + (slice(-1, None),) + (slice(None),) * (
+        x.ndim - axis - 1
+    )
+    return _segmented_cumsum_block(x, reset, None, axis, dtype)[slc]
+
+
+def _segmented_cumsum_combine(tail_left, has_left, tail_right, has_right):
+    """Associative combine of per-block (tail, has_reset) summaries"""
+    tail = np.where(has_right, tail_right, tail_left + tail_right)
+    return tail, np.logical_or(has_left, has_right)
+
+
+def _segmented_cumsum_sequential(x, reset, axis, dtype, name):
+    n = x.numblocks[axis]
+    slc = (slice(None),) * axis + (slice(-1, None),) + (slice(None),) * (
+        x.ndim - axis - 1
+    )
+    indices = list(
+        product(*[range(nb) if i != axis else [0] for i, nb in enumerate(x.numblocks)])
+    )
+    dsk = {}
+    carries = {}
+    for ind in indices:
+        carries[ind] = None
+        dsk[(name,) + ind] = (
+            _segmented_cumsum_block,
+            (x.name,) + ind,
+            (reset.name,) + ind,
+            None,
+            axis,
+            dtype,
+        )
+    for i in range(1, n):
+        last_indices = indices
+        indices = list(
+            product(
+                *[range(nb) if ii != axis else [i] for ii, nb in enumerate(x.numblocks)]
+            )
+        )
+        for old, ind in zip(last_indices, indices):
+            if x.chunks[axis][i - 1] == 0:
+                # Empty blocks pass the incoming carry through unchanged
+                carry = carries[old]
+            else:
+                carry = (operator.getitem, (name,) + old, slc)
+            carries[ind] = carry
+            dsk[(name,) + ind] = (
+                _segmented_cumsum_block,
+                (x.name,) + ind,
+                (reset.name,) + ind,
+                carry,
+                axis,
+                dtype,
+            )
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[x, reset])
+    return Array(graph, name, x.chunks, dtype, meta=x._meta)
+
+
+def _segmented_cumsum_blelloch(x, reset, axis, dtype, name):
+    n = x.numblocks[axis]
+    base_key = (name,)
+    summary_chunks = x.chunks[:axis] + ((1,) * n,) + x.chunks[axis + 1 :]
+    tails = x.map_blocks(
+        partial(_segmented_cumsum_tail, axis=axis, dtype=dtype),
+        reset,
+        dtype=dtype,
+        chunks=summary_chunks,
+    )
+    has_resets = reset.map_blocks(
+        np.any, axis=axis, keepdims=True, dtype=bool, chunks=summary_chunks
+    )
+
+    indices = [
+        list(
+            product(
+                *[range(nb) if j != axis else [i] for j, nb in enumerate(x.numblocks)]
+            )
+        )
+        for i in range(n)
+    ]
+    # Each value is a (tail, has_reset) pair of task references
+    prefix_vals = [
+        [((tails.name,) + index, (has_resets.name,) + index) for index in vals]
+        for vals in indices
+    ]
+    dsk = {}
+    n_vals = len(prefix_vals)
+    level = 0
+    if n_vals >= 2:
+        # Upsweep
+        stride = 1
+        stride2 = 2
+        while stride2 <= n_vals:
+            for i in range(stride2 - 1, n_vals, stride2):
+                new_vals = []
+                for index, left, right in zip(
+                    indices[i], prefix_vals[i - stride], prefix_vals[i]
+                ):
+                    key = base_key + ("summary",) + index + (level, i)
+                    dsk[key] = (
+                        _segmented_cumsum_combine,
+                        left[0],
+                        left[1],
+                        right[0],
+                        right[1],
+                    )
+                    new_vals.append(
+                        ((operator.getitem, key, 0), (operator.getitem, key, 1))
+                    )
+                prefix_vals[i] = new_vals
+            stride = stride2
+            stride2 *= 2
+            level += 1
+
+        # Downsweep
+        # With `n_vals == 3`, we would have `stride = 1` and `stride = 0`, but we
+        # need to do a downsweep iteration, so make sure stride2 is at least 2.
+        stride2 = builtins.max(2, 2 ** math.ceil(math.log2(n_vals // 2)))
+        stride = stride2 // 2
+        while stride > 0:
+            for i in range(stride2 + stride - 1, n_vals, stride2):
+                new_vals = []
+                for index, left, right in zip(
+                    indices[i], prefix_vals[i - stride], prefix_vals[i]
+                ):
+                    key = base_key + ("summary",) + index + (level, i)
+                    dsk[key] = (
+                        _segmented_cumsum_combine,
+                        left[0],
+                        left[1],
+                        right[0],
+                        right[1],
+                    )
+                    new_vals.append(
+                        ((operator.getitem, key, 0), (operator.getitem, key, 1))
+                    )
+                prefix_vals[i] = new_vals
+            stride2 = stride
+            stride //= 2
+            level += 1
+
+    for index in indices[0]:
+        dsk[base_key + index] = (
+            _segmented_cumsum_block,
+            (x.name,) + index,
+            (reset.name,) + index,
+            None,
+            axis,
+            dtype,
+        )
+    for indexes, vals in zip(drop(1, indices), prefix_vals):
+        for index, val in zip(indexes, vals):
+            dsk[base_key + index] = (
+                _segmented_cumsum_block,
+                (x.name,) + index,
+                (reset.name,) + index,
+                val[0],
+                axis,
+                dtype,
+            )
+
+    if n_vals < 2:
+        deps = [x, reset]
+    else:
+        deps = [x, reset, tails, has_resets]
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=deps)
+    return Array(graph, name, x.chunks, dtype, meta=x._meta)
+
+
+def segmented_cumsum(x, reset, axis=None, dtype=None, out=None, method="sequential"):
+    """Cumulative sum with resets along the given axis
+
+    At every position along `axis` the running sum is first reset to zero
+    where `reset` is True, then the current value of `x` is added.  This
+    computes a separate cumulative sum for each segment delimited by True
+    values in `reset`, without rechunking the axis into a single chunk.
+
+    Parameters
+    ----------
+    x : dask Array
+        Values to accumulate.
+    reset : dask Array
+        Boolean array of the same shape as `x`.  A True value starts a new
+        segment at that position.  It may be chunked differently than `x`;
+        both arrays are aligned to a common chunking first.
+    axis : int, optional
+        Axis along which to accumulate.  By default, use the flattened input
+        array.
+    dtype : dtype, optional
+        Type of the returned array and of the accumulator.  Defaults to the
+        dtype of `np.cumsum` for `x`, following the same rules as
+        :func:`dask.array.cumsum`.
+    out : dask Array, optional
+        Alternate output array in which to place the result.
+    method : {'sequential', 'blelloch'}, optional
+        Choose which method to use to propagate the running sum across chunks.
+        Default is 'sequential'.  Both methods define the same segments and
+        give the same result; they only differ in parallelism.
+
+        * 'sequential' performs the scan of each prior chunk before the
+          current chunk.
+        * 'blelloch' is a work-efficient parallel scan.  It exposes
+          parallelism by first summarizing each chunk and combining the
+          summaries via a binary tree.
+
+    Returns
+    -------
+    dask Array
+        Segmented cumulative sum of `x` with the same shape and chunks as
+        `x`.
+
+    See Also
+    --------
+    cumsum
+
+    Examples
+    --------
+    >>> import dask.array as da
+    >>> x = da.arange(8, chunks=3)
+    >>> reset = da.from_array(
+    ...     np.array([True, False, False, True, False, False, True, False])
+    ... )
+    >>> da.segmented_cumsum(x, reset, axis=0).compute()
+    array([ 0,  1,  3,  3,  7, 12,  6, 13])
+    """
+    if method not in ("sequential", "blelloch"):
+        raise ValueError(
+            'Invalid method for segmented_cumsum.  Expected "sequential" or '
+            f'"blelloch".  Got: {method!r}'
+        )
+    x = asanyarray(x)
+    reset = asanyarray(reset)
+    if reset.shape != x.shape:
+        raise ValueError(
+            f"reset and x must have the same shape.  Got: {reset.shape} and {x.shape}"
+        )
+    if axis is None:
+        if x.ndim > 1:
+            x = x.flatten()
+            reset = reset.flatten()
+        axis = 0
+    if dtype is None:
+        dtype = getattr(np.cumsum(np.ones((0,), dtype=x.dtype)), "dtype", object)
+    assert isinstance(axis, Integral)
+    axis = validate_axis(axis, x.ndim)
+
+    if x.shape[axis] == 0:
+        # Nothing to accumulate; the result is empty with the cumsum dtype
+        return handle_out(out, x.astype(dtype))
+
+    # Align x and reset to a common chunking without merging the scan axis
+    # into a single chunk
+    ind = tuple(range(x.ndim))
+    _, (x, reset) = unify_chunks(x, ind, reset, ind)
+
+    name = f"segmented-cumsum-{tokenize(x, reset, axis, dtype, method)}"
+    if method == "blelloch":
+        result = _segmented_cumsum_blelloch(x, reset, axis, dtype, name)
+    else:
+        result = _segmented_cumsum_sequential(x, reset, axis, dtype, name)
+    return handle_out(out, result)
 
 
 def topk(a, k, axis=-1, split_every=None):

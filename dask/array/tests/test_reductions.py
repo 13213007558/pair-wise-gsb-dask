@@ -711,6 +711,229 @@ def test_array_cumreduction_out(func):
     assert_eq(x, func(np.ones((10, 10)), axis=0))
 
 
+def _segmented_cumsum_ref(x, reset, axis=0, dtype=None):
+    """Sequential reference implementation of a segmented cumsum"""
+    dtype = np.cumsum(np.ones((0,), dtype=x.dtype), dtype=dtype).dtype
+    xt = np.moveaxis(np.asarray(x, dtype=dtype), axis, 0)
+    rt = np.moveaxis(np.asarray(reset, dtype=bool), axis, 0)
+    out = np.empty_like(xt)
+    acc = np.zeros(xt.shape[1:], dtype=dtype)
+    for i in range(xt.shape[0]):
+        acc = np.where(rt[i], 0, acc) + xt[i]
+        out[i] = acc
+    return np.moveaxis(out, 0, axis)
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+@pytest.mark.parametrize(
+    "data_chunks,reset_chunks",
+    [
+        ((4, 4, 4, 4, 4), (4, 4, 4, 4, 4)),
+        ((3, 1, 6, 2, 8), (5, 5, 5, 5)),
+        ((7, 2, 1, 10), (1, 1, 1, 1, 16)),
+        ((20,), (2, 3, 15)),
+        ((2, 3, 15), (20,)),
+    ],
+)
+def test_segmented_cumsum_irregular_chunks(method, data_chunks, reset_chunks):
+    rng = np.random.default_rng(42)
+    a = rng.integers(-5, 10, size=20)
+    reset = rng.random(20) < 0.25
+    dx = da.from_array(a, chunks=data_chunks)
+    dr = da.from_array(reset, chunks=reset_chunks)
+    result = da.segmented_cumsum(dx, dr, axis=0, method=method)
+    assert_eq(result, _segmented_cumsum_ref(a, reset, axis=0))
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+@pytest.mark.parametrize(
+    "reset",
+    [
+        pytest.param([False] * 12, id="no-reset"),
+        pytest.param([True] * 12, id="all-reset"),
+        pytest.param([True, False, False] * 4, id="reset-on-chunk-boundary"),
+        pytest.param([False, True, False] * 4, id="reset-in-chunk-middle"),
+        pytest.param(
+            [False, True, True, False, False, True, True, True, False, False, False, False],
+            id="consecutive-resets",
+        ),
+        pytest.param(
+            [True, False, False, False, False, False, False, False, False, False, False, True],
+            id="reset-at-ends",
+        ),
+    ],
+)
+def test_segmented_cumsum_reset_positions(method, reset):
+    a = np.arange(1, 13)
+    reset = np.array(reset)
+    dx = da.from_array(a, chunks=(3, 3, 3, 3))
+    dr = da.from_array(reset, chunks=(3, 3, 3, 3))
+    result = da.segmented_cumsum(dx, dr, axis=0, method=method)
+    assert_eq(result, _segmented_cumsum_ref(a, reset, axis=0))
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+@pytest.mark.parametrize(
+    "data_chunks,reset_chunks",
+    [
+        ((0, 4, 0, 4, 0), (8,)),
+        ((3, 0, 0, 5), (0, 8)),
+        ((0, 0, 8), (2, 0, 6)),
+        ((8, 0, 0), (1, 1, 1, 1, 1, 1, 1, 1)),
+        ((0, 0), (0,)),
+    ],
+)
+def test_segmented_cumsum_empty_chunks(method, data_chunks, reset_chunks):
+    rng = np.random.default_rng(0)
+    n = sum(data_chunks)
+    a = rng.integers(0, 5, size=n)
+    reset = rng.random(n) < 0.3
+    dx = da.from_array(a, chunks=data_chunks)
+    dr = da.from_array(reset, chunks=reset_chunks)
+    result = da.segmented_cumsum(dx, dr, axis=0, method=method)
+    assert_eq(result, _segmented_cumsum_ref(a, reset, axis=0))
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+@pytest.mark.parametrize("axis", [0, 1, 2, -1])
+def test_segmented_cumsum_multidim(method, axis):
+    rng = np.random.default_rng(3)
+    a = rng.integers(0, 5, size=(6, 7, 8))
+    reset = rng.random(a.shape) < 0.2
+    dx = da.from_array(a, chunks=(2, 3, 4))
+    dr = da.from_array(reset, chunks=(3, (2, 2, 3), (4, 4)))
+    result = da.segmented_cumsum(dx, dr, axis=axis, method=method)
+    assert_eq(result, _segmented_cumsum_ref(a, reset, axis=axis))
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+def test_segmented_cumsum_axis_none(method):
+    a = np.arange(12).reshape(3, 4)
+    reset = np.zeros((3, 4), dtype=bool)
+    reset[0, 2] = True
+    reset[1, 0] = True
+    dx = da.from_array(a, chunks=(2, 3))
+    dr = da.from_array(reset, chunks=(1, 2))
+    result = da.segmented_cumsum(dx, dr, axis=None, method=method)
+    assert_eq(result, _segmented_cumsum_ref(a.ravel(), reset.ravel(), axis=0))
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+@pytest.mark.parametrize("dtype", [None, "f4", "f8", "i8"])
+def test_segmented_cumsum_dtype(method, dtype):
+    a = np.linspace(0, 1, num=10)
+    reset = np.zeros(10, dtype=bool)
+    reset[4] = True
+    dx = da.from_array(a, chunks=3)
+    dr = da.from_array(reset, chunks=3)
+    result = da.segmented_cumsum(dx, dr, axis=0, dtype=dtype, method=method)
+    expected = _segmented_cumsum_ref(a, reset, axis=0, dtype=dtype)
+    assert result.dtype == expected.dtype
+    assert_eq(result, expected)
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+def test_segmented_cumsum_no_reset_matches_cumsum(method):
+    a = np.arange(10)
+    reset = np.zeros(10, dtype=bool)
+    dx = da.from_array(a, chunks=3)
+    dr = da.from_array(reset, chunks=4)
+    result = da.segmented_cumsum(dx, dr, axis=0, method=method)
+    assert_eq(result, np.cumsum(a))
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+def test_segmented_cumsum_out(method):
+    a = np.arange(10.0)
+    reset = np.zeros(10, dtype=bool)
+    reset[5] = True
+    dx = da.from_array(a, chunks=4)
+    dr = da.from_array(reset, chunks=4)
+    out = da.zeros(10, chunks=4)
+    da.segmented_cumsum(dx, dr, axis=0, method=method, out=out)
+    assert_eq(out, _segmented_cumsum_ref(a, reset, axis=0))
+
+
+def test_segmented_cumsum_array_method():
+    a = np.arange(10)
+    reset = np.zeros(10, dtype=bool)
+    reset[3] = True
+    dx = da.from_array(a, chunks=3)
+    dr = da.from_array(reset, chunks=3)
+    assert_eq(dx.segmented_cumsum(dr, axis=0), _segmented_cumsum_ref(a, reset, axis=0))
+
+
+def test_segmented_cumsum_shape_mismatch():
+    dx = da.ones(10, chunks=5)
+    dr = da.zeros(11, chunks=5, dtype=bool)
+    with pytest.raises(ValueError, match="same shape"):
+        da.segmented_cumsum(dx, dr, axis=0)
+
+
+def test_segmented_cumsum_invalid_method():
+    dx = da.ones(10, chunks=5)
+    dr = da.zeros(10, chunks=5, dtype=bool)
+    with pytest.raises(ValueError, match="Invalid method"):
+        da.segmented_cumsum(dx, dr, axis=0, method="foo")
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+def test_segmented_cumsum_no_rechunk_when_aligned(method):
+    x = da.ones((5,))
+    reset = da.zeros((5,), dtype=bool)
+    y = da.segmented_cumsum(x, reset, axis=0, method=method)
+    assert "rechunk" not in str(dict(y.__dask_graph__()))
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+def test_segmented_cumsum_keeps_multiple_chunks(method):
+    x = da.ones(20, chunks=5)
+    reset = da.zeros(20, chunks=4, dtype=bool)
+    result = da.segmented_cumsum(x, reset, axis=0, method=method)
+    # The scan axis is never merged into a single chunk
+    assert len(result.chunks[0]) > 1
+    assert max(result.chunks[0]) < 20
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+def test_segmented_cumsum_no_data_read_at_graph_construction(method):
+    class StrictArray:
+        def __init__(self, shape, dtype):
+            self.shape = shape
+            self.dtype = np.dtype(dtype)
+            self.ndim = len(shape)
+
+        def __getitem__(self, item):
+            raise AssertionError("must not read data at graph construction time")
+
+    x = da.from_array(StrictArray((10,), "f8"), chunks=3)
+    reset = da.from_array(StrictArray((10,), bool), chunks=4)
+    da.segmented_cumsum(x, reset, axis=0, method=method)
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_segmented_cumsum_random_chunkings(method, seed):
+    rng = np.random.default_rng(seed)
+    a = rng.integers(-3, 5, size=30)
+    reset = rng.random(30) < 0.3
+
+    def random_chunks(n):
+        chunks = []
+        left = n
+        while left:
+            chunks.append(min(int(rng.integers(1, 6)), left))
+            left -= chunks[-1]
+            if rng.random() < 0.2:
+                chunks.append(0)
+        return tuple(chunks)
+
+    dx = da.from_array(a, chunks=random_chunks(30))
+    dr = da.from_array(reset, chunks=random_chunks(30))
+    result = da.segmented_cumsum(dx, dr, axis=0, method=method)
+    assert_eq(result, _segmented_cumsum_ref(a, reset, axis=0))
+
+
 @pytest.mark.parametrize(
     "npfunc,daskfunc", [(np.sort, da.topk), (np.argsort, da.argtopk)]
 )

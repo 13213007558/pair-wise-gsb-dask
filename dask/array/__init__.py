@@ -438,6 +438,7 @@ try:
         prod,
         quantile,
         reduction,
+        segmented_cumsum,
         std,
         sum,
         topk,

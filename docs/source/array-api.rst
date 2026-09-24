@@ -211,6 +211,7 @@ Top level functions
    round
    searchsorted
    select
+   segmented_cumsum
    shape
    shuffle
    sign
@@ -306,6 +307,7 @@ Array
    Array.reshape
    Array.round
    Array.shape
+   Array.segmented_cumsum
    Array.shuffle
    Array.size
    Array.squeeze

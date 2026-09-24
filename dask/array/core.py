@@ -2782,6 +2782,21 @@ class Array(DaskMethodsMixin):
 
         return cumprod(self, axis, dtype, out=out, method=method)
 
+    def segmented_cumsum(
+        self, reset, axis, dtype=None, out=None, *, method="sequential"
+    ):
+        """Return the cumulative sum, restarted wherever `reset` is True.
+
+        Refer to :func:`dask.array.segmented_cumsum` for full documentation.
+
+        See Also
+        --------
+        dask.array.segmented_cumsum : equivalent function
+        """
+        from dask.array.reductions import segmented_cumsum
+
+        return segmented_cumsum(self, reset, axis, dtype, out=out, method=method)
+
     def squeeze(self, axis=None):
         """Remove axes of length one from array.
 
