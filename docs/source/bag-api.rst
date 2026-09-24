@@ -40,6 +40,7 @@ Top-level functions
    map_partitions
    to_textfiles
    zip
+   zip_global
 
 Random Sampling
 ---------------

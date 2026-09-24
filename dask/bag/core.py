@@ -2038,6 +2038,172 @@ def bag_zip(*bags):
     return Bag(graph, name, npartitions)
 
 
+def _zip_global_offsets(lengths, npartitions, mode):
+    """Compute per-partition global start offsets for each bag.
+
+    ``lengths`` is a flat list of partition lengths, grouped by bag.
+    Returns ``(starts, totals)`` where ``starts[k]`` holds the global start
+    offset of every partition of bag ``k`` (plus the total as final entry)
+    and ``totals[k]`` is the total number of elements of bag ``k``.
+    """
+    starts = []
+    totals = []
+    pos = 0
+    for npart in npartitions:
+        bag_starts = [0]
+        for length in lengths[pos : pos + npart]:
+            bag_starts.append(bag_starts[-1] + length)
+        pos += npart
+        starts.append(bag_starts)
+        totals.append(bag_starts[-1])
+    if mode == "raise" and len(set(totals)) > 1:
+        raise ValueError(
+            "zip_global requires all bags to have the same length, "
+            f"got lengths {totals}. Use mode='truncate' or mode='fill' "
+            "to align bags of different lengths."
+        )
+    return starts, totals
+
+
+def _zip_global_slice(offsets, k, i, is_last_partition, mode, partitions):
+    """Extract the elements of bag ``k`` covered by output partition ``i``.
+
+    Output partition ``i`` spans the global positions of partition ``i`` of
+    the first bag, clamped to the shortest bag for ``mode='truncate'`` and
+    extended to the longest bag on the last partition for ``mode='fill'``.
+    """
+    starts, totals = offsets
+    start = starts[0][i]
+    stop = starts[0][i + 1]
+    if mode == "truncate":
+        shortest = min(totals)
+        start = min(start, shortest)
+        stop = min(stop, shortest)
+    elif mode == "fill" and is_last_partition:
+        stop = max(totals)
+    out = []
+    for part, part_start in zip(partitions, starts[k]):
+        lo = max(start - part_start, 0)
+        hi = min(stop - part_start, len(part))
+        if lo < hi:
+            out.extend(part[lo:hi])
+    return out
+
+
+def _zip_global_partition(parts, mode, fillvalue):
+    """Zip the per-bag slices of one output partition."""
+    if mode == "fill":
+        return list(itertools.zip_longest(*parts, fillvalue=fillvalue))
+    if mode == "raise" and len({len(part) for part in parts}) > 1:
+        raise ValueError("Bags have different lengths")
+    return list(zip(*parts))
+
+
+def bag_zip_global(*bags, mode="raise", fillvalue=None):
+    """Zip bags by aligning elements on their global position
+
+    Unlike :func:`dask.bag.zip`, which zips corresponding partitions and
+    requires all bags to have the same number of partitions, this aligns
+    elements by their position in the concatenation of all partitions, so
+    the bags may be partitioned differently.  The result has the same number
+    of partitions as the first bag.
+
+    The lengths of the partitions are only known at execution time, so the
+    alignment is computed as part of the task graph; nothing is computed
+    eagerly when the graph is built, and upstream tasks are only executed
+    once even if their outputs are one-shot iterators.
+
+    Parameters
+    ----------
+    *bags : Bag
+        The bags to zip together.
+    mode : {"raise", "truncate", "fill"}, optional
+        What to do when the bags have different total lengths:
+
+        - ``"raise"`` (default): raise a ``ValueError``.
+        - ``"truncate"``: stop at the shortest bag, like the builtin
+          :func:`zip`.
+        - ``"fill"``: extend to the longest bag, filling missing values
+          with ``fillvalue``, like :func:`itertools.zip_longest`.
+    fillvalue : optional
+        Value used to pad shorter bags when ``mode="fill"``.  Defaults to
+        ``None``.
+
+    Examples
+    --------
+    >>> import dask.bag as db
+    >>> left = db.from_sequence(["a", "b", "c"], npartitions=3)
+    >>> right = db.from_sequence([1, 2, 3], npartitions=2)
+    >>> db.zip_global(left, right).compute()
+    [('a', 1), ('b', 2), ('c', 3)]
+
+    Bags of different lengths require an explicit choice:
+
+    >>> shorter = db.range(3, npartitions=2)
+    >>> longer = db.range(5, npartitions=2)
+    >>> db.zip_global(shorter, longer, mode="truncate").compute()
+    [(0, 0), (1, 1), (2, 2)]
+    >>> db.zip_global(shorter, longer, mode="fill").compute()
+    [(0, 0), (1, 1), (2, 2), (None, 3), (None, 4)]
+    >>> db.zip_global(shorter, longer).compute()  # doctest: +ELLIPSIS
+    Traceback (most recent call last):
+    ...
+    ValueError: zip_global requires all bags to have the same length...
+
+    See Also
+    --------
+    dask.bag.zip : Partition-wise zip
+    """
+    if not bags:
+        raise ValueError("Provide at least one bag to zip")
+    modes = ("raise", "truncate", "fill")
+    if mode not in modes:
+        raise ValueError(f"mode must be one of {modes}, got {mode!r}")
+
+    token = tokenize(*bags, mode, fillvalue)
+    name = f"zip-global-{token}"
+    reify_name = f"zip-global-reify-{token}"
+    len_name = f"zip-global-len-{token}"
+    offsets_name = f"zip-global-offsets-{token}"
+    slice_name = f"zip-global-slice-{token}"
+
+    npartitions = [bag.npartitions for bag in bags]
+    dsk = {}
+    length_keys = []
+    for k, bag in enumerate(bags):
+        for j in range(bag.npartitions):
+            # Reify each partition exactly once so that downstream tasks can
+            # safely consume it multiple times (lengths and slices) even if
+            # the upstream partition is a one-shot iterator.
+            dsk[(reify_name, k, j)] = (reify, (bag.name, j))
+            dsk[(len_name, k, j)] = (len, (reify_name, k, j))
+            length_keys.append((len_name, k, j))
+    dsk[(offsets_name, 0)] = (
+        _zip_global_offsets,
+        length_keys,
+        npartitions,
+        mode,
+    )
+    for i in range(npartitions[0]):
+        slices = []
+        for k, bag in enumerate(bags):
+            slice_key = (slice_name, k, i)
+            dsk[slice_key] = (
+                _zip_global_slice,
+                (offsets_name, 0),
+                k,
+                i,
+                i == npartitions[0] - 1,
+                mode,
+                [(reify_name, k, j) for j in range(bag.npartitions)],
+            )
+            slices.append(slice_key)
+        dsk[(name, i)] = (_zip_global_partition, slices, mode, fillvalue)
+
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=bags)
+    return Bag(graph, name, npartitions[0])
+
+
 def map_chunk(f, iters, iter_kwarg_keys=None, kwargs=None):
     """Map ``f`` across one or more iterables, maybe with keyword arguments.
 

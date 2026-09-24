@@ -1263,6 +1263,84 @@ def test_zip(npartitions, hi=1000):
     assert list(pairs) == list(zip(range(0, hi, 2), range(1, hi, 2)))
 
 
+@pytest.mark.parametrize("scheduler", ["sync", "threads"])
+def test_zip_global(scheduler):
+    # [a, b], [], [c] on the left and [1], [2, 3] on the right
+    left = db.from_sequence([["a", "b"], [], ["c"]], npartitions=3).flatten()
+    right = db.from_sequence([[1], [2, 3]], npartitions=2).flatten()
+    assert left.npartitions == 3
+    assert right.npartitions == 2
+    pairs = db.zip_global(left, right)
+    assert pairs.npartitions == left.npartitions
+    assert pairs.compute(scheduler=scheduler) == [("a", 1), ("b", 2), ("c", 3)]
+
+
+@pytest.mark.parametrize("np1,np2", [(1, 4), (4, 1), (3, 5), (5, 3), (2, 2)])
+def test_zip_global_various_partitions(np1, np2):
+    evens = db.from_sequence(range(0, 20, 2), npartitions=np1)
+    odds = db.from_sequence(range(1, 20, 2), npartitions=np2)
+    pairs = db.zip_global(evens, odds)
+    assert pairs.npartitions == evens.npartitions
+    assert list(pairs) == list(zip(range(0, 20, 2), range(1, 20, 2)))
+
+
+def test_zip_global_three_bags():
+    a = db.from_sequence(range(6), npartitions=2)
+    b = db.from_sequence(range(10, 16), npartitions=3)
+    c = db.from_sequence(range(20, 26), npartitions=1)
+    result = db.zip_global(a, b, c)
+    assert list(result) == [(i, i + 10, i + 20) for i in range(6)]
+
+
+def test_zip_global_length_mismatch():
+    shorter = db.range(3, npartitions=2)
+    longer = db.range(5, npartitions=2)
+
+    assert db.zip_global(shorter, longer, mode="truncate").compute() == [
+        (0, 0),
+        (1, 1),
+        (2, 2),
+    ]
+    assert db.zip_global(shorter, longer, mode="fill").compute() == [
+        (0, 0),
+        (1, 1),
+        (2, 2),
+        (None, 3),
+        (None, 4),
+    ]
+    assert db.zip_global(longer, shorter, mode="fill", fillvalue=-1).compute() == [
+        (0, 0),
+        (1, 1),
+        (2, 2),
+        (3, -1),
+        (4, -1),
+    ]
+    with pytest.raises(ValueError, match="same length"):
+        db.zip_global(shorter, longer).compute()
+    with pytest.raises(ValueError, match="mode must be one of"):
+        db.zip_global(shorter, longer, mode="unknown")
+
+
+def test_zip_global_one_shot_iterators():
+    # Partitions that are one-shot iterators must not be consumed twice,
+    # and the user function must run exactly once per partition.
+    calls = []
+
+    def make_iter(part):
+        calls.append(None)
+        return iter(part)
+
+    left = db.from_sequence([["a", "b"], [], ["c"]], npartitions=3)
+    left = left.map_partitions(make_iter)
+    right = db.from_sequence([[1], [2, 3]], npartitions=2)
+    right = right.map_partitions(make_iter)
+
+    pairs = db.zip_global(left, right)
+    assert not calls  # nothing computed while building the graph
+    assert pairs.compute(scheduler="sync") == [("a", 1), ("b", 2), ("c", 3)]
+    assert len(calls) == 5
+
+
 @pytest.mark.parametrize("nin", [1, 2, 7, 11, 23])
 @pytest.mark.parametrize("nout", [1, 2, 5, 12, 23])
 def test_repartition_npartitions(nin, nout):
