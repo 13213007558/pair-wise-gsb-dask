@@ -265,6 +265,118 @@ def argtopk_aggregate(a_plus_idx, k, axis, keepdims):
     ]
 
 
+def _topk_stable_key(a, idx, k):
+    """Structured (value, index) array used as the stable top-k selection key.
+
+    The key is a total order: values compare with the usual NumPy semantics
+    (NaN is the largest value; -0.0 and +0.0 compare equal), and ties are
+    broken by the original position along the axis. For k > 0 (top k), the
+    index is negated so that, among equal values, the *smallest* original
+    index compares as the largest.
+    """
+    key = np.empty(a.shape, dtype=[("v", a.dtype), ("i", np.intp)])
+    key["v"] = a
+    key["i"] = idx if k < 0 else -idx
+    return key
+
+
+def _argtopk_stable_select(a, idx, k, axis):
+    """Select the top-|k| candidates, breaking ties by original index.
+
+    Return a (values, indices) tuple with the best abs(k) elements of a along
+    axis, in unspecified internal order. The selection rule is the same at
+    every step of a tree reduction, so intermediate candidates already obey
+    the final stable ordering.
+    """
+    kk = abs(k)
+    n = a.shape[axis]
+    if kk == 0:
+        empty = tuple(slice(0, 0) if i == axis else slice(None) for i in range(a.ndim))
+        return a[empty], idx[empty]
+    if kk >= n:
+        return a, idx
+
+    key = _topk_stable_key(a, idx, k)
+    if k > 0:
+        kth = n - kk
+        k_slice = slice(n - kk, None)
+    else:
+        kth = kk - 1
+        k_slice = slice(kk)
+    part = np.argpartition(key, kth, axis=axis)
+    part = part[tuple(k_slice if i == axis else slice(None) for i in range(a.ndim))]
+    return np.take_along_axis(a, part, axis), np.take_along_axis(idx, part, axis)
+
+
+def _argtopk_stable_sort(a, idx, k, axis):
+    """Sort stable top-k candidates by value and, on ties, by original index.
+
+    Sort by value descending (ascending original index on ties) if k > 0,
+    and by value ascending (ascending original index on ties) if k < 0.
+    """
+    key = _topk_stable_key(a, idx, k)
+    order = np.argsort(key, axis=axis)
+    a = np.take_along_axis(a, order, axis)
+    idx = np.take_along_axis(idx, order, axis)
+    if k > 0:
+        rev = tuple(
+            slice(None, None, -1) if i == axis else slice(None) for i in range(a.ndim)
+        )
+        a = a[rev]
+        idx = idx[rev]
+    return a, idx
+
+
+def argtopk_stable(a_plus_idx, k, axis, keepdims):
+    """Chunk and combine function of argtopk with stable tie-breaking
+
+    Like argtopk, but equal values are selected by their original position
+    along the axis. This rule is applied to the intermediate candidates at
+    every step of the tree reduction, so the final result does not depend on
+    the chunking or on split_every.
+    """
+    assert keepdims is True
+    axis = axis[0]
+
+    if isinstance(a_plus_idx, list):
+        a_plus_idx = list(flatten(a_plus_idx))
+        a = np.concatenate([ai for ai, _ in a_plus_idx], axis)
+        idx = np.concatenate(
+            [np.broadcast_to(idxi, ai.shape) for ai, idxi in a_plus_idx], axis
+        )
+    else:
+        a, idx = a_plus_idx
+
+    return _argtopk_stable_select(a, idx, k, axis)
+
+
+def argtopk_stable_aggregate(a_plus_idx, k, axis, keepdims):
+    """Final aggregation function of argtopk with stable tie-breaking
+
+    Invoke argtopk_stable one final time, sort the candidates by value and
+    original index, drop the data and return the index only.
+    """
+    assert keepdims is True
+    a_plus_idx = a_plus_idx if len(a_plus_idx) > 1 else a_plus_idx[0]
+    a, idx = argtopk_stable(a_plus_idx, k, axis, keepdims)
+    _, idx = _argtopk_stable_sort(a, idx, k, axis[0])
+    return idx
+
+
+def topk_stable_aggregate(a_plus_idx, k, axis, keepdims):
+    """Final aggregation function of topk with stable tie-breaking
+
+    Invoke argtopk_stable one final time, sort the candidates by value and
+    original index, drop the index and return the data only. The selected
+    elements are the same ones pointed to by argtopk_stable_aggregate.
+    """
+    assert keepdims is True
+    a_plus_idx = a_plus_idx if len(a_plus_idx) > 1 else a_plus_idx[0]
+    a, idx = argtopk_stable(a_plus_idx, k, axis, keepdims)
+    a, _ = _argtopk_stable_sort(a, idx, k, axis[0])
+    return a
+
+
 def arange(start, stop, step, length, dtype, like=None):
     from dask.array.utils import arange_safe
 

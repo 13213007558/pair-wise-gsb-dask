@@ -793,6 +793,118 @@ def test_topk_argtopk3():
     )
 
 
+def _stable_topk_reference(x, k, axis):
+    """Reference stable top-k indices, computed with a full sort.
+
+    Stable semantics: values compare with the usual NumPy ordering (NaN is
+    the largest value, -0.0 == +0.0); ties are broken by ascending original
+    position along the axis. Results are sorted by value (descending for
+    k > 0, ascending for k < 0), with ties in ascending index order.
+    """
+    axis = axis % x.ndim
+    n = x.shape[axis]
+    kk = min(abs(k), n)
+    key = np.empty(x.shape, dtype=[("v", x.dtype), ("i", np.intp)])
+    key["v"] = x
+    idx = np.arange(n).reshape([n if i == axis else 1 for i in range(x.ndim)])
+    idx = np.broadcast_to(idx, x.shape)
+    key["i"] = idx if k < 0 else -idx
+    order = np.argsort(key, axis=axis)
+    if k > 0:
+        sel = np.take(order, range(n - kk, n), axis=axis)
+        return np.flip(sel, axis=axis)
+    return np.take(order, range(kk), axis=axis)
+
+
+@pytest.mark.parametrize("split_every", [None, 2, 3, 5])
+@pytest.mark.parametrize(
+    "chunks", [(100,), (50, 50), (30, 40, 30), (10,) * 10, (1,) * 100, (7, 33, 60)]
+)
+@pytest.mark.parametrize("k", [0, 1, 3, 10, 100, 150, -1, -3, -10, -100, -150])
+def test_topk_argtopk_stable(split_every, chunks, k):
+    """With stable=True, ties between equal values are broken by original
+    position along the axis at every level of the tree reduction, so the
+    selected indices are element-wise identical for any chunking and
+    split_every, and topk/argtopk point to the same elements.
+    """
+    rng = np.random.default_rng(42)
+    # heavy ties: only 4 distinct values over 100 elements
+    x = rng.integers(0, 4, size=100).astype(float)
+    x[10] = np.nan
+    x[55] = np.nan
+    x[3] = -0.0
+    x[70] = 0.0
+
+    d = da.from_array(x, chunks=chunks)
+    expected_idx = _stable_topk_reference(x, k, axis=0)
+
+    idx = d.argtopk(k, split_every=split_every, stable=True)
+    top = d.topk(k, split_every=split_every, stable=True)
+    if abs(k) <= x.shape[0]:
+        assert_eq(idx, expected_idx)
+        assert_eq(top, x[expected_idx])
+    else:
+        # When k exceeds the axis length, the shape metadata reports the
+        # requested output size; compare the computed values instead.
+        np.testing.assert_array_equal(idx.compute(), expected_idx)
+        np.testing.assert_array_equal(top.compute(), x[expected_idx])
+    # topk and argtopk must point to the same elements
+    np.testing.assert_array_equal(x[idx.compute()], top.compute())
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2, -1])
+@pytest.mark.parametrize("split_every", [None, 2, 3])
+@pytest.mark.parametrize("k", [3, -3, 7, -7])
+def test_topk_argtopk_stable_multidim(axis, split_every, k):
+    rng = np.random.default_rng(1)
+    x = rng.integers(0, 3, size=(10, 20, 30)).astype(float)
+    x[2, 5, 7] = np.nan
+    x[4, 0, 0] = np.nan
+
+    d = da.from_array(x, chunks=(4, 8, 8))
+    expected_idx = _stable_topk_reference(x, k, axis)
+    idx = d.argtopk(k, axis=axis, split_every=split_every, stable=True)
+    top = d.topk(k, axis=axis, split_every=split_every, stable=True)
+    assert_eq(idx, expected_idx)
+    assert_eq(top, np.take_along_axis(x, expected_idx, axis=axis % x.ndim))
+
+
+@pytest.mark.parametrize("k", [1, 2, 3, -1, -2, -3])
+def test_topk_argtopk_stable_nan(k):
+    """NaN follows NumPy semantics: it compares as the largest value, so it
+    is selected first by topk and last by bottom-k."""
+    x = np.array([np.nan, 1.0, np.nan, 0.0, 2.0])
+    d = da.from_array(x, chunks=(2, 2, 1))
+    expected_idx = _stable_topk_reference(x, k, axis=0)
+    assert_eq(d.argtopk(k, split_every=2, stable=True), expected_idx)
+    assert_eq(d.topk(k, split_every=2, stable=True), x[expected_idx])
+
+
+def test_topk_argtopk_stable_signed_zero():
+    """-0.0 and +0.0 compare equal (NumPy semantics); the tie is broken by
+    original position along the axis."""
+    x = np.array([0.0, -0.0, 0.0, -0.0, 1.0])
+    d = da.from_array(x, chunks=2)
+    # 1.0 first, then the zeros in position order
+    assert_eq(d.argtopk(3, stable=True), np.array([4, 0, 1]))
+    assert_eq(d.argtopk(-3, stable=True), np.array([0, 1, 2]))
+    # the selected zeros keep their original sign
+    assert np.signbit(d.topk(3, stable=True).compute()).tolist() == [False, False, True]
+    assert np.signbit(d.topk(-3, stable=True).compute()).tolist() == [False, True, False]
+
+
+def test_topk_argtopk_stable_methods():
+    a = da.random.default_rng().integers(0, 3, (10, 20), chunks=(4, 8))
+    assert_eq(
+        a.topk(5, axis=1, split_every=2, stable=True),
+        da.topk(a, 5, axis=1, split_every=2, stable=True),
+    )
+    assert_eq(
+        a.argtopk(5, axis=1, split_every=2, stable=True),
+        da.argtopk(a, 5, axis=1, split_every=2, stable=True),
+    )
+
+
 @pytest.mark.parametrize(
     "func",
     [da.cumsum, da.cumprod, da.argmin, da.argmax, da.min, da.max, da.nansum, da.nanmax],

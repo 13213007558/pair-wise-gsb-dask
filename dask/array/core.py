@@ -2267,7 +2267,7 @@ class Array(DaskMethodsMixin):
             shape = shape[0]
         return reshape(self, shape, merge_chunks=merge_chunks, limit=limit)
 
-    def topk(self, k, axis=-1, split_every=None):
+    def topk(self, k, axis=-1, split_every=None, stable=False):
         """The top k elements of an array.
 
         Refer to :func:`dask.array.topk` for full documentation.
@@ -2278,9 +2278,9 @@ class Array(DaskMethodsMixin):
         """
         from dask.array.reductions import topk
 
-        return topk(self, k, axis=axis, split_every=split_every)
+        return topk(self, k, axis=axis, split_every=split_every, stable=stable)
 
-    def argtopk(self, k, axis=-1, split_every=None):
+    def argtopk(self, k, axis=-1, split_every=None, stable=False):
         """The indices of the top k elements of an array.
 
         Refer to :func:`dask.array.argtopk` for full documentation.
@@ -2291,7 +2291,7 @@ class Array(DaskMethodsMixin):
         """
         from dask.array.reductions import argtopk
 
-        return argtopk(self, k, axis=axis, split_every=split_every)
+        return argtopk(self, k, axis=axis, split_every=split_every, stable=stable)
 
     def astype(self, dtype, **kwargs):
         """Copy of the array, cast to a specified type.

@@ -1344,11 +1344,20 @@ def cumprod(x, axis=None, dtype=None, out=None, method="sequential"):
     )
 
 
-def topk(a, k, axis=-1, split_every=None):
+def topk(a, k, axis=-1, split_every=None, stable=False):
     """Extract the k largest elements from a on the given axis,
     and return them sorted from largest to smallest.
     If k is negative, extract the -k smallest elements instead,
     and return them sorted from smallest to largest.
+
+    When ``stable=True``, elements that compare equal are selected by
+    their original position along the axis: among equal values, the element
+    that comes first along the axis is preferred, at every step of the tree
+    reduction. The selection therefore does not depend on the chunking or on
+    ``split_every``, and it matches the elements pointed to by
+    :func:`argtopk` with ``stable=True``. Values follow the usual NumPy
+    ordering: NaN compares as the largest value, and -0.0 and +0.0 compare
+    equal (their tie is broken by position).
 
     This performs best when ``k`` is much smaller than the chunk size. All
     results will be returned in a single chunk along the given axis.
@@ -1365,6 +1374,10 @@ def topk(a, k, axis=-1, split_every=None):
         prevents getting the whole or a significant portion of the input array
         in memory all at once, with a negative impact on network transfer
         too when running on distributed.
+    stable: bool, optional
+        If True, break ties between equal values by original position along
+        the axis (see above). If False (default), the selection among equal
+        values is unspecified and may vary with the chunking.
 
     Returns
     -------
@@ -1381,6 +1394,9 @@ def topk(a, k, axis=-1, split_every=None):
     array([1, 3])
     """
     axis = validate_axis(axis, a.ndim)
+
+    if stable:
+        return _topk_argtopk_stable(a, k, axis, split_every, return_indices=False)
 
     # chunk and combine steps of the reduction, which recursively invoke
     # np.partition to pick the top/bottom k elements from the previous step.
@@ -1403,11 +1419,20 @@ def topk(a, k, axis=-1, split_every=None):
     )
 
 
-def argtopk(a, k, axis=-1, split_every=None):
+def argtopk(a, k, axis=-1, split_every=None, stable=False):
     """Extract the indices of the k largest elements from a on the given axis,
     and return them sorted from largest to smallest. If k is negative, extract
     the indices of the -k smallest elements instead, and return them sorted
     from smallest to largest.
+
+    When ``stable=True``, elements that compare equal are selected by
+    their original position along the axis: among equal values, the element
+    that comes first along the axis is preferred, at every step of the tree
+    reduction. The selection therefore does not depend on the chunking or on
+    ``split_every``, and it matches the elements returned by
+    :func:`topk` with ``stable=True``. Values follow the usual NumPy
+    ordering: NaN compares as the largest value, and -0.0 and +0.0 compare
+    equal (their tie is broken by position).
 
     This performs best when ``k`` is much smaller than the chunk size. All
     results will be returned in a single chunk along the given axis.
@@ -1421,6 +1446,10 @@ def argtopk(a, k, axis=-1, split_every=None):
     split_every: int >=2, optional
         See :func:`topk`. The performance considerations for topk also apply
         here.
+    stable: bool, optional
+        If True, break ties between equal values by original position along
+        the axis (see above). If False (default), the selection among equal
+        values is unspecified and may vary with the chunking.
 
     Returns
     -------
@@ -1437,6 +1466,9 @@ def argtopk(a, k, axis=-1, split_every=None):
     array([1, 2])
     """
     axis = validate_axis(axis, a.ndim)
+
+    if stable:
+        return _topk_argtopk_stable(a, k, axis, split_every, return_indices=True)
 
     # Generate nodes where every chunk is a tuple of (a, original index of a)
     idx = arange(a.shape[axis], chunks=(a.chunks[axis],), dtype=np.intp)
@@ -1468,6 +1500,58 @@ def argtopk(a, k, axis=-1, split_every=None):
         axis=axis,
         keepdims=True,
         dtype=np.intp,
+        split_every=split_every,
+        concatenate=False,
+        output_size=abs(k),
+        meta=meta,
+    )
+
+
+def _topk_argtopk_stable(a, k, axis, split_every, return_indices):
+    """Shared implementation of topk and argtopk with stable=True.
+
+    Carry the original indices through the reduction so that ties on equal
+    values can be broken by original position along the axis, at every step
+    of the tree reduction and not just in the final aggregation. topk and
+    argtopk share the same selection, so they always point to the same
+    elements.
+    """
+    # Generate nodes where every chunk is a tuple of (a, original index of a)
+    idx = arange(a.shape[axis], chunks=(a.chunks[axis],), dtype=np.intp)
+    idx = idx[tuple(slice(None) if i == axis else np.newaxis for i in range(a.ndim))]
+    a_plus_idx = a.map_blocks(chunk.argtopk_preprocess, idx, dtype=object)
+
+    # chunk and combine steps of the reduction. They acquire in input a tuple
+    # of (a, original indices of a) and return another tuple containing the
+    # best abs(k) candidates and the matching original indices, selected by
+    # (value, original index) so that ties are resolved deterministically.
+    chunk_combine = partial(chunk.argtopk_stable, k=k)
+    # aggregate step of the reduction. Internally invokes the chunk/combine
+    # function, then sorts the candidates by (value, original index) and
+    # drops either the index or the data.
+    aggregate = partial(
+        chunk.argtopk_stable_aggregate
+        if return_indices
+        else chunk.topk_stable_aggregate,
+        k=k,
+    )
+
+    if isinstance(axis, Number):
+        naxis = 1
+    else:
+        naxis = len(axis)
+
+    dtype = np.intp if return_indices else a.dtype
+    meta = a._meta.astype(dtype).reshape((0,) * (a.ndim - naxis + 1))
+
+    return reduction(
+        a_plus_idx,
+        chunk=chunk_combine,
+        combine=chunk_combine,
+        aggregate=aggregate,
+        axis=axis,
+        keepdims=True,
+        dtype=dtype,
         split_every=split_every,
         concatenate=False,
         output_size=abs(k),
