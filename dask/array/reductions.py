@@ -20,6 +20,7 @@ from dask.array import chunk
 from dask.array.core import (
     Array,
     _concatenate2,
+    asanyarray,
     handle_out,
     implements,
     unknown_chunk_message,
@@ -1342,6 +1343,296 @@ def cumprod(x, axis=None, dtype=None, out=None, method="sequential"):
         method=method,
         preop=np.prod,
     )
+
+
+def _segmented_cumsum_local(x, reset, axis, dtype):
+    """Segmented cumulative sum of a single block with a zero accumulator."""
+    c = np.cumsum(x, axis=axis, dtype=dtype)
+    n = x.shape[axis]
+    if n == 0:
+        return c
+    shape = [1] * x.ndim
+    shape[axis] = n
+    idx = np.arange(n).reshape(shape)
+    # Position of the most recent reset at or before each element (-1 if none).
+    last = np.maximum.accumulate(np.where(reset, idx, -1), axis=axis)
+    gather = np.clip(last - 1, 0, n - 1)
+    cprev = np.take_along_axis(c, gather, axis=axis)
+    base = np.where(last >= 1, cprev, 0)
+    return c - base
+
+
+def _segmented_cumsum_preop(x, reset, axis, dtype):
+    """Summarize a block as an (any_reset, tail, total) monoid element.
+
+    tail is the sum of the last segment in the block (the segment that
+    starts at the final True in reset, inclusive).  An empty block yields
+    the identity element (False, 0, 0).
+    """
+    any_reset = np.any(reset, axis=axis, keepdims=True)
+    total = np.sum(x, axis=axis, dtype=dtype, keepdims=True)
+    n = x.shape[axis]
+    if n == 0:
+        tail = np.zeros_like(total)
+    else:
+        # future[j] is True when a reset exists in positions j..n-1.
+        future = np.flip(
+            np.logical_or.accumulate(np.flip(reset, axis=axis), axis=axis), axis=axis
+        )
+        shifted = np.roll(future, -1, axis=axis)
+        slc = [slice(None)] * x.ndim
+        slc[axis] = -1
+        shifted[tuple(slc)] = False
+        # x[j] contributes to the tail when no reset occurs after position j.
+        tail = np.sum(np.where(shifted, 0, x), axis=axis, dtype=dtype, keepdims=True)
+    return any_reset, tail, total
+
+
+def _segmented_cumsum_merge(a, b):
+    """Combine summaries of two consecutive spans (a followed by b)."""
+    a_any, a_tail, a_total = a
+    b_any, b_tail, b_total = b
+    return (
+        a_any | b_any,
+        np.where(b_any, b_tail, a_tail + b_total),
+        a_total + b_total,
+    )
+
+
+def _segmented_cumsum_apply(x, reset, summary, axis, dtype):
+    """Apply the carry held in summary to the local result of a block."""
+    local = _segmented_cumsum_local(x, reset, axis, dtype)
+    if x.shape[axis] == 0:
+        return local
+    carry = summary[1]
+    seen = np.logical_or.accumulate(reset, axis=axis)
+    return np.where(seen, local, local + carry)
+
+
+def _segmented_cumsum_sequential(x, reset, axis, dtype):
+    name = f"segmented-cumsum-{tokenize(x, reset, axis, dtype)}"
+    n = x.numblocks[axis]
+    indices = [
+        list(
+            product(
+                *[range(nb) if j != axis else [i] for j, nb in enumerate(x.numblocks)]
+            )
+        )
+        for i in range(n)
+    ]
+    dsk = {}
+    for i in range(n):
+        for ind in indices[i]:
+            x_key = (x.name,) + ind
+            reset_key = (reset.name,) + ind
+            out_key = (name,) + ind
+            if i == 0:
+                dsk[out_key] = (
+                    _segmented_cumsum_local,
+                    x_key,
+                    reset_key,
+                    axis,
+                    dtype,
+                )
+            else:
+                prev = ind[:axis] + (i - 1,) + ind[axis + 1 :]
+                carry_key = (name, "carry") + ind
+                prev_summary = (name, "summary") + prev
+                if i == 1:
+                    dsk[carry_key] = prev_summary
+                else:
+                    dsk[carry_key] = (
+                        _segmented_cumsum_merge,
+                        (name, "carry") + prev,
+                        prev_summary,
+                    )
+                dsk[out_key] = (
+                    _segmented_cumsum_apply,
+                    x_key,
+                    reset_key,
+                    carry_key,
+                    axis,
+                    dtype,
+                )
+            if i < n - 1:
+                dsk[(name, "summary") + ind] = (
+                    _segmented_cumsum_preop,
+                    x_key,
+                    reset_key,
+                    axis,
+                    dtype,
+                )
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[x, reset])
+    return Array(graph, name, x.chunks, dtype)
+
+
+def _segmented_cumsum_blelloch(x, reset, axis, dtype):
+    """Tree scan variant; exposes block-level parallelism via a prefix tree."""
+    name = f"segmented-cumsum-blelloch-{tokenize(x, reset, axis, dtype)}"
+    base_key = (name,)
+    n = x.numblocks[axis]
+    *indices, last_index = full_indices = [
+        list(
+            product(
+                *[range(nb) if j != axis else [i] for j, nb in enumerate(x.numblocks)]
+            )
+        )
+        for i in range(n)
+    ]
+    prefix_vals = []
+    dsk = {}
+    for inds in indices:
+        vals = []
+        for ind in inds:
+            key = (name, "summary") + ind
+            dsk[key] = (
+                _segmented_cumsum_preop,
+                (x.name,) + ind,
+                (reset.name,) + ind,
+                axis,
+                dtype,
+            )
+            vals.append(key)
+        prefix_vals.append(vals)
+
+    n_vals = len(prefix_vals)
+    level = 0
+    if n_vals >= 2:
+        # Upsweep
+        stride = 1
+        stride2 = 2
+        while stride2 <= n_vals:
+            for i in range(stride2 - 1, n_vals, stride2):
+                new_vals = []
+                for index, left_val, right_val in zip(
+                    indices[i], prefix_vals[i - stride], prefix_vals[i]
+                ):
+                    key = base_key + index + (level, i)
+                    dsk[key] = (_segmented_cumsum_merge, left_val, right_val)
+                    new_vals.append(key)
+                prefix_vals[i] = new_vals
+            stride = stride2
+            stride2 *= 2
+            level += 1
+
+        # Downsweep
+        stride2 = builtins.max(2, 2 ** math.ceil(math.log2(n_vals // 2)))
+        stride = stride2 // 2
+        while stride > 0:
+            for i in range(stride2 + stride - 1, n_vals, stride2):
+                new_vals = []
+                for index, left_val, right_val in zip(
+                    indices[i], prefix_vals[i - stride], prefix_vals[i]
+                ):
+                    key = base_key + index + (level, i)
+                    dsk[key] = (_segmented_cumsum_merge, left_val, right_val)
+                    new_vals.append(key)
+                prefix_vals[i] = new_vals
+            stride2 = stride
+            stride //= 2
+            level += 1
+
+    for index in full_indices[0]:
+        dsk[base_key + index] = (
+            _segmented_cumsum_local,
+            (x.name,) + index,
+            (reset.name,) + index,
+            axis,
+            dtype,
+        )
+    for indexes, vals in zip(drop(1, full_indices), prefix_vals):
+        for index, val in zip(indexes, vals):
+            dsk[base_key + index] = (
+                _segmented_cumsum_apply,
+                (x.name,) + index,
+                (reset.name,) + index,
+                val,
+                axis,
+                dtype,
+            )
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[x, reset])
+    return Array(graph, name, x.chunks, dtype)
+
+
+def segmented_cumsum(x, reset, axis=None, dtype=None, out=None, method="sequential"):
+    """Cumulative sum that restarts at every position where reset is True.
+
+    This performs a segmented (resetting) cumulative sum along axis: at each
+    position the accumulator is first set to zero if reset is True there,
+    and the value of x at that position is then added.
+
+    The axis does not need to live in a single chunk, and reset may use a
+    different chunking than x; it is rechunked to match x during graph
+    construction without reading any data.
+
+    Parameters
+    ----------
+    x : Array
+        Values to cumulatively sum.
+    reset : Array
+        Boolean array with the same shape as x.  A True value starts a new
+        cumulative sum at that position (the value of x there is included in
+        the new segment).
+    axis : int, optional
+        Axis along which the cumulative sum is performed.  The default of
+        None flattens both arrays first.
+    dtype : dtype, optional
+        Dtype of the returned array.  Defaults to the dtype np.cumsum
+        chooses for x.dtype.
+    out : Array, optional
+        Existing dask array in which to place the result.
+    method : {'sequential', 'blelloch'}, optional
+        Choose how the scan across chunks is scheduled.  The default is
+        'sequential'.
+
+        * 'sequential' propagates the accumulated value through the chunks
+          in order along axis.
+        * 'blelloch' combines per-chunk summaries with a binary tree,
+          exposing more block-level parallelism.  Both methods define the
+          same segments; only the parallelism differs.
+
+    Returns
+    -------
+    Array
+
+    Examples
+    --------
+    >>> import dask.array as da
+    >>> x = da.from_array([1.0, 2.0, 3.0, 4.0, 5.0], chunks=2)
+    >>> reset = da.from_array([False, False, True, False, False], chunks=2)
+    >>> da.segmented_cumsum(x, reset).compute()
+    array([ 1.,  3.,  3.,  7., 12.])
+    """
+    if method not in ("sequential", "blelloch"):
+        raise ValueError(
+            'Invalid method for segmented_cumsum. Expected "sequential" or '
+            f'"blelloch". Got: {method!r}'
+        )
+    x = asanyarray(x)
+    reset = asanyarray(reset)
+    if reset.shape != x.shape:
+        raise ValueError(
+            f"reset must have the same shape as x. Got {reset.shape} and {x.shape}"
+        )
+    if reset.dtype != np.bool_:
+        raise TypeError(f"reset must be a boolean array. Got dtype {reset.dtype}")
+    if axis is None:
+        if x.ndim > 1:
+            x = x.flatten().rechunk(chunks=x.npartitions)
+            reset = reset.flatten()
+        axis = 0
+    assert isinstance(axis, Integral)
+    axis = validate_axis(axis, x.ndim)
+    if dtype is None:
+        dtype = getattr(np.cumsum(np.ones((0,), dtype=x.dtype)), "dtype", object)
+    if reset.chunks != x.chunks:
+        reset = reset.rechunk(x.chunks)
+
+    if method == "blelloch":
+        result = _segmented_cumsum_blelloch(x, reset, axis, dtype)
+    else:
+        result = _segmented_cumsum_sequential(x, reset, axis, dtype)
+    return handle_out(out, result)
 
 
 def topk(a, k, axis=-1, split_every=None):

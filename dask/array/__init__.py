@@ -149,6 +149,7 @@ __all__ = [
     "prod",
     "quantile",
     "reduction",
+    "segmented_cumsum",
     "std",
     "sum",
     "topk",
@@ -438,6 +439,7 @@ try:
         prod,
         quantile,
         reduction,
+        segmented_cumsum,
         std,
         sum,
         topk,
@@ -838,6 +840,7 @@ if _array_expr_enabled():
         argtopk = raise_not_implemented_error("argtopk")
         cumprod = raise_not_implemented_error("cumprod")
         cumsum = raise_not_implemented_error("cumsum")
+        segmented_cumsum = raise_not_implemented_error("segmented_cumsum")
         median = raise_not_implemented_error("median")
         nanargmax = raise_not_implemented_error("nanargmax")
         nanargmin = raise_not_implemented_error("nanargmin")
