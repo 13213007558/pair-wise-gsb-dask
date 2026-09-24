@@ -22,7 +22,6 @@ from tlz import (
     first,
     frequencies,
     groupby,
-    join,
     merge,
     merge_with,
     partition_all,
@@ -1148,7 +1147,15 @@ class Bag(DaskMethodsMixin):
         """Standard deviation"""
         return self.var(ddof=ddof).apply(math.sqrt)
 
-    def join(self, other, on_self, on_other=None):
+    def join(
+        self,
+        other,
+        on_self,
+        on_other=None,
+        how="inner",
+        npartitions=None,
+        missing=None,
+    ):
         """Joins collection with another collection.
 
         Other collection must be one of the following:
@@ -1159,7 +1166,11 @@ class Bag(DaskMethodsMixin):
             other collection is sizable and you're using the distributed
             scheduler.  Dask is able to pass around data wrapped in delayed
             objects with greater sophistication.
-        3.  A Bag with a single partition
+        3.  A Bag.  A single-partition Bag is broadcast to every partition of
+            this collection.  If both collections are multi-partition Bags,
+            both sides are shuffled on their join keys so that records with
+            equal keys are routed to the same output partition; the right
+            side is never broadcast in that case.
 
         You might also consider Dask Dataframe, whose join operations are much
         more heavily optimized.
@@ -1170,10 +1181,21 @@ class Bag(DaskMethodsMixin):
             Other collection on which to join
         on_self: callable
             Function to call on elements in this collection to determine a
-            match
+            match.  Keys must be hashable.
         on_other: callable (defaults to on_self)
             Function to call on elements in the other collection to determine a
-            match
+            match.  Keys must be hashable.
+        how: "inner" or "left" (defaults to "inner")
+            Type of join to perform.  With "left", every element of this
+            collection is emitted exactly once; elements without a match in
+            ``other`` are paired with ``missing``.
+        npartitions: int (optional)
+            Number of output partitions when both collections are Bags and
+            ``other`` has multiple partitions.  Defaults to the larger of the
+            two input partition counts.  Ignored otherwise.
+        missing: object (defaults to None)
+            Marker paired with unmatched elements of this collection when
+            ``how="left"``.
 
         Examples
         --------
@@ -1182,36 +1204,58 @@ class Bag(DaskMethodsMixin):
         >>> fruit = ['Apple', 'Apricot', 'Banana']
         >>> list(people.join(fruit, lambda x: x[0]))
         [('Apple', 'Alice'), ('Apricot', 'Alice'), ('Banana', 'Bob')]
+
+        With ``how="left"`` unmatched elements of this collection are kept,
+        paired with the ``missing`` marker:
+
+        >>> list(people.join(fruit, lambda x: x[0], how='left'))
+        [('Apple', 'Alice'), ('Apricot', 'Alice'), ('Banana', 'Bob'), (None, 'Charlie')]
+
+        Two multi-partition Bags are joined by shuffling both sides on their
+        join keys:
+
+        >>> left = db.from_sequence([('a', 1), ('b', 2)], npartitions=2)
+        >>> right = db.from_sequence([('a', 3), ('a', 4)], npartitions=2)
+        >>> sorted(left.join(right, on_self=lambda x: x[0], on_other=lambda x: x[0]).compute())
+        [(('a', 3), ('a', 1)), (('a', 4), ('a', 1))]
         """
-        token = tokenize(self, other, on_self, on_other)
+        if how not in ("inner", "left"):
+            msg = f"how must be 'inner' or 'left', got {how!r}"
+            raise ValueError(msg)
+
+        if on_other is None:
+            on_other = on_self
+
+        if isinstance(other, Bag) and other.npartitions > 1:
+            return _join_bags(self, other, on_self, on_other, how, npartitions, missing)
+
+        token = tokenize(self, other, on_self, on_other, how, missing)
         name = f"join-{token}"
         dsk = {}
         if isinstance(other, Bag):
-            if other.npartitions == 1:
-                dsk.update(other.dask)
-                other = other.__dask_keys__()[0]
-                dsk[f"join-{name}-other"] = (list, other)
-            else:
-                msg = (
-                    "Multi-bag joins are not implemented. "
-                    "We recommend Dask dataframe if appropriate"
-                )
-                raise NotImplementedError(msg)
+            dsk.update(other.dask)
+            dsk[f"join-{name}-other"] = (list, other.__dask_keys__()[0])
+            other = f"join-{name}-other"
         elif isinstance(other, Delayed):
             dsk.update(other.dask)
             other = other._key
         elif not isinstance(other, Iterable):
             msg = (
-                "Joined argument must be single-partition Bag, "
-                f" delayed object, or Iterable, got {type(other).__name}"
+                "Joined argument must be a Bag, "
+                f" delayed object, or Iterable, got {type(other).__name__}"
             )
             raise TypeError(msg)
 
-        if on_other is None:
-            on_other = on_self
-
         for i in range(self.npartitions):
-            dsk[(name, i)] = (list, (join, on_other, other, on_self, (self.name, i)))
+            dsk[(name, i)] = (
+                chunk.join_chunk,
+                on_other,
+                other,
+                on_self,
+                (self.name, i),
+                how,
+                missing,
+            )
 
         graph = HighLevelGraph.from_collections(name, dsk, dependencies=[self])
         return type(self)(graph, name, self.npartitions)
@@ -2510,6 +2554,62 @@ def groupby_disk(b, grouper, npartitions=None, blocksize=2**20):
     dsk = merge(dsk1, dsk2, dsk3, dsk4)
     graph = HighLevelGraph.from_collections(name, dsk, dependencies=[b])
     return type(b)(graph, name, npartitions)
+
+
+def _join_bags(left, right, on_left, on_right, how, npartitions, missing):
+    """Hash-shuffle join between two multi-partition Bags.
+
+    Both sides are repartitioned by a deterministic hash of their join key
+    so that records with equal keys are routed to the same output partition.
+    Neither side is broadcast in full, and no data is pulled back into the
+    client process while the graph is being built.
+    """
+    if npartitions is None:
+        npartitions = max(left.npartitions, right.npartitions)
+    elif npartitions < 1:
+        raise ValueError(f"npartitions must be a positive integer, got {npartitions}")
+
+    token = tokenize(left, right, on_left, on_right, how, npartitions, missing)
+    name = f"join-{token}"
+    split_left = f"join-split-left-{token}"
+    split_right = f"join-split-right-{token}"
+    collect_left = f"join-collect-left-{token}"
+    collect_right = f"join-collect-right-{token}"
+
+    dsk = {}
+    for i in range(left.npartitions):
+        dsk[(split_left, i)] = (
+            chunk.join_partition,
+            on_left,
+            npartitions,
+            "left",
+            (left.name, i),
+        )
+    for i in range(right.npartitions):
+        dsk[(split_right, i)] = (
+            chunk.join_partition,
+            on_right,
+            npartitions,
+            "right",
+            (right.name, i),
+        )
+    for j in range(npartitions):
+        left_parts = [(operator.getitem, (split_left, i), j) for i in range(left.npartitions)]
+        right_parts = [(operator.getitem, (split_right, i), j) for i in range(right.npartitions)]
+        dsk[(collect_left, j)] = (list, (toolz.concat, left_parts))
+        dsk[(collect_right, j)] = (list, (toolz.concat, right_parts))
+        dsk[(name, j)] = (
+            chunk.join_chunk,
+            on_right,
+            (collect_right, j),
+            on_left,
+            (collect_left, j),
+            how,
+            missing,
+        )
+
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[left, right])
+    return type(left)(graph, name, npartitions)
 
 
 def empty_safe_apply(func, part, is_last):

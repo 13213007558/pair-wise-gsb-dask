@@ -448,6 +448,97 @@ def test_join(transform):
     assert c.name == b.join(other, on_self=isodd, on_other=iseven).name
 
 
+def first_key(x):
+    return x[0]
+
+
+def test_join_multi_partition():
+    left = db.from_sequence([("a", 1), ("a", 2), ("b", 3)], npartitions=2)
+    right = db.from_sequence([("a", "x"), ("a", "y"), ("c", "z")], npartitions=3)
+    result = left.join(right, on_self=first_key, on_other=first_key)
+    # The right side is shuffled, not broadcast: the output has
+    # max(2, 3) partitions rather than one partition per pair of inputs
+    assert result.npartitions == 3
+    # Duplicate keys produce the full cartesian match:
+    # two right records times two left records give four pairs
+    expected = [
+        (("a", "x"), ("a", 1)),
+        (("a", "x"), ("a", 2)),
+        (("a", "y"), ("a", 1)),
+        (("a", "y"), ("a", 2)),
+    ]
+    assert sorted(result.compute()) == sorted(expected)
+    assert result.name == left.join(right, on_self=first_key, on_other=first_key).name
+
+
+def test_join_multi_partition_empty_partitions():
+    left = Bag({("l", 0): [1, 2, 3], ("l", 1): [], ("l", 2): [4]}, "l", 3)
+    right = Bag({("r", 0): [2], ("r", 1): [], ("r", 2): [4, 4], ("r", 3): []}, "r", 4)
+    result = left.join(right, lambda x: x, npartitions=5)
+    assert result.npartitions == 5
+    expected = list(join(lambda x: x, [2, 4, 4], lambda x: x, [1, 2, 3, 4]))
+    assert sorted(result.compute()) == sorted(expected)
+
+
+def test_join_multi_partition_left():
+    left = db.from_sequence([1, 2, 3, 4], npartitions=2)
+    right = db.from_sequence([2, 4, 4], npartitions=3)
+    result = left.join(right, lambda x: x, how="left")
+    # Unmatched left records are emitted exactly once, paired with the
+    # missing marker; matched ones pair with every matching right record
+    expected = [(None, 1), (2, 2), (None, 3), (4, 4), (4, 4)]
+    assert sorted(result.compute(), key=str) == sorted(expected, key=str)
+
+
+def test_join_multi_partition_left_missing_marker():
+    left = db.from_sequence([1, 2], npartitions=2)
+    right = db.from_sequence([2], npartitions=2)
+    result = left.join(right, lambda x: x, how="left", missing="N/A")
+    assert sorted(result.compute(), key=str) == sorted([("N/A", 1), (2, 2)], key=str)
+
+
+def test_join_left_single_partition_other():
+    other = db.from_sequence([2, 4], npartitions=1)
+    result = b.join(other, lambda x: x, how="left")
+    expected = []
+    for x in L:
+        if x == 2:
+            expected.append((2, 2))
+        elif x == 4:
+            expected.append((4, 4))
+        else:
+            expected.append((None, x))
+    assert sorted(result.compute(), key=str) == sorted(expected, key=str)
+
+
+def test_join_multi_partition_unhashable_key():
+    left = db.from_sequence([[1], [2]], npartitions=2)
+    right = db.from_sequence([1, 2], npartitions=2)
+    with pytest.raises(TypeError, match="left side"):
+        left.join(right, lambda x: x).compute()
+    with pytest.raises(TypeError, match="right side"):
+        right.join(left, lambda x: x).compute()
+
+
+def test_join_invalid_how():
+    with pytest.raises(ValueError, match="how"):
+        b.join([1, 2, 3], isodd, how="full")
+
+
+def test_join_multi_partition_is_lazy():
+    calls = []
+
+    def spy(x):
+        calls.append(x)
+        return x
+
+    left = db.from_sequence([1, 2, 3], npartitions=2)
+    right = db.from_sequence([1, 2], npartitions=2)
+    left.join(right, spy)
+    # Building the join graph must not process any record in this process
+    assert calls == []
+
+
 def test_foldby():
     c = b.foldby(iseven, add, 0, add, 0)
     assert (reduceby, iseven, add, (b.name, 0), 0) in list(c.dask.values())
