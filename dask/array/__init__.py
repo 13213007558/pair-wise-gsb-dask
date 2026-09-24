@@ -115,6 +115,7 @@ __all__ = [
     "gufunc",
     "moveaxis",
     "rollaxis",
+    "rolling_quantile",
     "optimize",
     "map_overlap",
     "push",
@@ -445,6 +446,7 @@ try:
         var,
     )
     from dask.array.reshape import reshape, reshape_blockwise
+    from dask.array.rolling import rolling_quantile
     from dask.array.routines import (
         allclose,
         append,
@@ -833,6 +835,7 @@ if _array_expr_enabled():
         rollaxis = raise_not_implemented_error("rollaxis")
         optimize = raise_not_implemented_error("optimize")
         percentile = raise_not_implemented_error("percentile")
+        rolling_quantile = raise_not_implemented_error("rolling_quantile")
         argmax = raise_not_implemented_error("argmax")
         argmin = raise_not_implemented_error("argmin")
         argtopk = raise_not_implemented_error("argtopk")

@@ -207,6 +207,7 @@ Top level functions
    rint
    roll
    rollaxis
+   rolling_quantile
    rot90
    round
    searchsorted
