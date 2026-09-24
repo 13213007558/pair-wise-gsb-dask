@@ -2038,6 +2038,189 @@ def bag_zip(*bags):
     return Bag(graph, name, npartitions)
 
 
+def _cum_partition_offsets(lengths):
+    """Cumulative start offsets from per-partition lengths.
+
+    Returns a list of ``len(lengths) + 1`` offsets; the last element is the
+    total number of elements.
+    """
+    offsets = [0]
+    for n in lengths:
+        offsets.append(offsets[-1] + n)
+    return offsets
+
+
+def _aligned_zip_bounds(offsets_per_bag, on_short, npartitions):
+    """Compute global index ranges for each output partition.
+
+    ``offsets_per_bag`` is a list of cumulative-offset lists, one per input
+    bag.  Returns a list of ``(start, stop)`` global index pairs, one per
+    output partition.  Raises ``ValueError`` if ``on_short == 'error'`` and
+    the bags do not all have the same total length.
+    """
+    totals = [offsets[-1] for offsets in offsets_per_bag]
+    if on_short == 'error':
+        if len(set(totals)) != 1:
+            raise ValueError(
+                "zip_align requires all bags to have the same number of "
+                f"elements when on_short='error'; got lengths {totals}. "
+                "Pass on_short='truncate' to drop extra elements or "
+                "on_short='fill' to pad the shorter side(s)."
+            )
+        length = totals[0]
+    elif on_short == 'truncate':
+        length = min(totals)
+    else:  # 'fill'
+        length = max(totals)
+
+    q, r = divmod(length, npartitions)
+    bounds = []
+    start = 0
+    for j in range(npartitions):
+        stop = start + q + (1 if j < r else 0)
+        bounds.append((start, stop))
+        start = stop
+    return bounds
+
+
+def _aligned_zip_slice(partition, offsets, i, bounds, j):
+    """Slice of input partition ``i`` belonging to output partition ``j``."""
+    lo = max(offsets[i], bounds[j][0])
+    hi = min(offsets[i + 1], bounds[j][1])
+    if lo >= hi:
+        return []
+    return list(partition[lo - offsets[i] : hi - offsets[i]])
+
+
+def _aligned_zip_partition(slices_per_bag, on_short, fillvalue):
+    """Zip the per-bag slices of a single output partition."""
+    parts = [
+        list(itertools.chain.from_iterable(slices)) for slices in slices_per_bag
+    ]
+    if on_short == 'fill':
+        return list(itertools.zip_longest(*parts, fillvalue=fillvalue))
+    return list(zip(*parts))
+
+
+def bag_zip_align(*bags, on_short='error', fillvalue=None, npartitions=None):
+    """Zip bags by global element position, across partition boundaries.
+
+    Unlike :func:`dask.bag.zip`, which zips corresponding partitions pairwise
+    and requires matching partition counts, this aligns elements by their
+    global position in each bag: the first element of the result pairs the
+    first elements of all inputs, regardless of how the inputs are
+    partitioned.
+
+    Partition lengths are only known at execution time, so they are computed
+    as part of the graph; nothing is computed eagerly when the graph is
+    built.  Each input partition is materialized at most once, so one-shot
+    iterators are safe and user functions are never run twice.
+
+    Parameters
+    ----------
+    *bags : Bag
+        Two or more bags to align element-wise.
+    on_short : {'error', 'truncate', 'fill'}, optional
+        What to do when the bags do not have the same total number of
+        elements:
+
+        - ``'error'`` (default): raise ``ValueError`` at compute time.
+        - ``'truncate'``: stop when the shortest bag is exhausted.
+        - ``'fill'``: pad the shorter bag(s) with ``fillvalue``.
+    fillvalue : optional
+        Value used to pad shorter bags when ``on_short='fill'``.
+    npartitions : int, optional
+        Number of partitions of the output bag.  Defaults to the maximum
+        number of partitions among the inputs.
+
+    Examples
+    --------
+    >>> import dask.bag as db
+    >>> left = db.from_sequence(['a', 'b', 'c'], npartitions=2)
+    >>> right = db.from_sequence([1, 2, 3], npartitions=3)
+    >>> list(db.zip_align(left, right))
+    [('a', 1), ('b', 2), ('c', 3)]
+
+    >>> short = db.from_sequence(['x', 'y'], npartitions=2)
+    >>> list(db.zip_align(left, short, on_short='truncate'))
+    [('a', 'x'), ('b', 'y')]
+    >>> list(db.zip_align(left, short, on_short='fill', fillvalue=None))
+    [('a', 'x'), ('b', 'y'), ('c', None)]
+    """
+    if not bags:
+        raise ValueError("zip_align requires at least one bag")
+    if on_short not in ('error', 'truncate', 'fill'):
+        raise ValueError(
+            f"on_short must be one of 'error', 'truncate', 'fill'; got {on_short!r}"
+        )
+    if npartitions is None:
+        npartitions = max(bag.npartitions for bag in bags)
+    if not isinstance(npartitions, int) or npartitions < 1:
+        raise ValueError(f"npartitions must be a positive integer; got {npartitions!r}")
+
+    token = tokenize(*bags, on_short, fillvalue, npartitions)
+    name = f"zip-align-{token}"
+    splits_name = f"zip-align-bounds-{token}"
+
+    dsk = {}
+    offset_keys = []
+    slice_keys_per_bag = []
+    for bag in bags:
+        btoken = tokenize(bag)
+        reify_name = f"zip-align-reify-{btoken}"
+        len_name = f"zip-align-len-{btoken}"
+        offsets_name = f"zip-align-offsets-{btoken}"
+        slice_name = f"zip-align-slice-{btoken}"
+        for i in range(bag.npartitions):
+            dsk[(reify_name, i)] = (reify, (bag.name, i))
+            dsk[(len_name, i)] = (len, (reify_name, i))
+        dsk[(offsets_name, 0)] = (
+            _cum_partition_offsets,
+            [(len_name, i) for i in range(bag.npartitions)],
+        )
+        offset_keys.append((offsets_name, 0))
+        slice_keys_per_bag.append(
+            [
+                [(slice_name, j, i) for i in range(bag.npartitions)]
+                for j in range(npartitions)
+            ]
+        )
+
+    dsk[(splits_name, 0)] = (
+        _aligned_zip_bounds,
+        list(offset_keys),
+        on_short,
+        npartitions,
+    )
+
+    for bag in bags:
+        btoken = tokenize(bag)
+        reify_name = f"zip-align-reify-{btoken}"
+        offsets_name = f"zip-align-offsets-{btoken}"
+        slice_name = f"zip-align-slice-{btoken}"
+        for j in range(npartitions):
+            for i in range(bag.npartitions):
+                dsk[(slice_name, j, i)] = (
+                    _aligned_zip_slice,
+                    (reify_name, i),
+                    (offsets_name, 0),
+                    i,
+                    (splits_name, 0),
+                    j,
+                )
+
+    for j in range(npartitions):
+        dsk[(name, j)] = (
+            _aligned_zip_partition,
+            [slice_keys[j] for slice_keys in slice_keys_per_bag],
+            on_short,
+            fillvalue,
+        )
+
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=bags)
+    return Bag(graph, name, npartitions)
+
+
 def map_chunk(f, iters, iter_kwarg_keys=None, kwargs=None):
     """Map ``f`` across one or more iterables, maybe with keyword arguments.
 

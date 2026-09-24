@@ -6,6 +6,7 @@ __all__ = [
     "map",
     "range",
     "zip",
+    "zip_align",
     "concat",
     "from_delayed",
     "from_sequence",
@@ -33,6 +34,7 @@ try:
     from dask.bag.core import bag_map as map
     from dask.bag.core import bag_range as range
     from dask.bag.core import bag_zip as zip
+    from dask.bag.core import bag_zip_align as zip_align
     from dask.bag.text import read_text
     from dask.bag.utils import assert_eq
     from dask.base import compute

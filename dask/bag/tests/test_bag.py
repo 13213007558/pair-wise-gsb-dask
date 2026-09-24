@@ -34,8 +34,10 @@ from dask.bag.core import (
     total_mem_usage,
 )
 from dask.bag.utils import assert_eq
+from dask.base import tokenize
 from dask.blockwise import Blockwise
 from dask.delayed import Delayed
+from dask.highlevelgraph import HighLevelGraph
 from dask.typing import Graph
 from dask.utils import filetexts, tmpdir, tmpfile
 from dask.utils_test import add, hlg_layer, inc
@@ -1261,6 +1263,123 @@ def test_zip(npartitions, hi=1000):
     assert pairs.npartitions == evens.npartitions
     assert pairs.npartitions == odds.npartitions
     assert list(pairs) == list(zip(range(0, hi, 2), range(1, hi, 2)))
+
+
+def _bag_with_partitions(partitions):
+    """Build a bag with exactly the given partition contents."""
+    name = 'test-bag-' + tokenize(partitions)
+    dsk = {(name, i): list(p) for i, p in enumerate(partitions)}
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=())
+    return Bag(graph, name, len(partitions))
+
+
+@pytest.mark.parametrize('scheduler', ['sync', 'threads'])
+def test_zip_align_across_partition_boundaries(scheduler):
+    # The motivating example: elements are aligned by global position,
+    # not by partition.
+    left = _bag_with_partitions([['a', 'b'], [], ['c']])
+    right = _bag_with_partitions([[1], [2, 3]])
+    result = db.zip_align(left, right)
+    assert list(result.compute(scheduler=scheduler)) == [
+        ('a', 1),
+        ('b', 2),
+        ('c', 3),
+    ]
+
+
+@pytest.mark.parametrize('scheduler', ['sync', 'threads'])
+def test_zip_align_mismatched_partition_counts(scheduler):
+    evens = db.from_sequence(range(0, 20, 2), npartitions=3)
+    odds = db.from_sequence(range(1, 20, 2), npartitions=4)
+    pairs = db.zip_align(evens, odds)
+    assert pairs.npartitions == 4
+    assert list(pairs.compute(scheduler=scheduler)) == list(
+        zip(range(0, 20, 2), range(1, 20, 2))
+    )
+
+
+def test_zip_align_npartitions():
+    a = db.from_sequence(range(10), npartitions=3)
+    b = db.from_sequence(range(10), npartitions=4)
+    result = db.zip_align(a, b, npartitions=2)
+    assert result.npartitions == 2
+    assert list(result) == [(i, i) for i in range(10)]
+
+
+def test_zip_align_error_on_unequal_lengths():
+    a = db.from_sequence(range(5), npartitions=2)
+    b = db.from_sequence(range(3), npartitions=2)
+    result = db.zip_align(a, b)
+    with pytest.raises(ValueError, match='same number of elements'):
+        result.compute()
+
+
+def test_zip_align_truncate():
+    a = db.from_sequence(range(5), npartitions=2)
+    b = db.from_sequence(range(3), npartitions=2)
+    assert list(db.zip_align(a, b, on_short='truncate')) == [(0, 0), (1, 1), (2, 2)]
+    assert list(db.zip_align(b, a, on_short='truncate')) == [(0, 0), (1, 1), (2, 2)]
+
+
+def test_zip_align_fill():
+    a = db.from_sequence(range(5), npartitions=2)
+    b = db.from_sequence(range(3), npartitions=2)
+    assert list(db.zip_align(a, b, on_short='fill', fillvalue=-1)) == [
+        (0, 0),
+        (1, 1),
+        (2, 2),
+        (3, -1),
+        (4, -1),
+    ]
+    assert list(db.zip_align(b, a, on_short='fill', fillvalue=-1)) == [
+        (0, 0),
+        (1, 1),
+        (2, 2),
+        (-1, 3),
+        (-1, 4),
+    ]
+
+
+def test_zip_align_invalid_arguments():
+    a = db.from_sequence(range(4), npartitions=2)
+    with pytest.raises(ValueError, match='at least one bag'):
+        db.zip_align()
+    with pytest.raises(ValueError, match='on_short'):
+        db.zip_align(a, a, on_short='bogus')
+    with pytest.raises(ValueError, match='npartitions'):
+        db.zip_align(a, a, npartitions=0)
+
+
+def _iter_partition(values):
+    # A partition that is a one-shot iterator.
+    return iter(values)
+
+
+def test_zip_align_one_shot_iterator_partitions():
+    # Partitions that are one-shot iterators must not be consumed more
+    # than once when computing partition lengths.
+    name = 'test-iter-bag'
+    parts = [['a', 'b'], [], ['c']]
+    dsk = {(name, i): (_iter_partition, list(p)) for i, p in enumerate(parts)}
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=())
+    left = Bag(graph, name, 3)
+    right = _bag_with_partitions([[1], [2, 3]])
+    assert list(db.zip_align(left, right)) == [('a', 1), ('b', 2), ('c', 3)]
+
+
+@pytest.mark.parametrize('scheduler', ['sync', 'threads'])
+def test_zip_align_runs_user_functions_once(scheduler):
+    calls = []
+
+    def track(x):
+        calls.append(x)
+        return x
+
+    left = db.from_sequence(range(6), npartitions=3).map(track)
+    right = db.from_sequence(range(6), npartitions=2)
+    result = db.zip_align(left, right)
+    assert list(result.compute(scheduler=scheduler)) == [(i, i) for i in range(6)]
+    assert sorted(calls) == list(range(6))
 
 
 @pytest.mark.parametrize("nin", [1, 2, 7, 11, 23])
