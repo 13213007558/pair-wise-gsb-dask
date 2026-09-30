@@ -14,6 +14,7 @@ from tlz import concat, curry, merge
 from dask import base, config, utils
 from dask._expr import FinalizeCompute, ProhibitReuse, _ExprSequence
 from dask._task_spec import (
+    Conditional,
     DataNode,
     Dict,
     GraphNode,
@@ -45,7 +46,7 @@ from dask.utils import (
     unzip,
 )
 
-__all__ = ["Delayed", "delayed"]
+__all__ = ["Delayed", "cond", "delayed"]
 
 
 DEFAULT_GET = named_schedulers.get("threads", named_schedulers["sync"])
@@ -645,6 +646,98 @@ def delayed(obj, name=None, pure=None, nout=None, traverse=True):
             task.key = name
         graph = HighLevelGraph.from_collections(name, layer, dependencies=collections)
         return Delayed(name, graph, nout)
+
+
+def _unpack_cond_arg(obj, name):
+    # Normalize a cond() argument to a graph key plus any tasks and
+    # collections required to compute it.
+    task, collections = unpack_collections(obj)
+    if isinstance(task, TaskRef):
+        return task.key, {}, collections
+    if isinstance(task, GraphNode):
+        return name, {name: task.substitute({}, key=name)}, collections
+    return name, {name: DataNode(name, task)}, collections
+
+
+def cond(condition, if_true, if_false, *, name=None, pure=None):
+    """Select between two branches based on a lazily evaluated condition.
+    
+        This builds a conditional task: only after ``condition`` has been
+        evaluated does the scheduler know which branch is required, and only
+        the tasks of the selected branch are scheduled. The unselected branch
+        is never executed, so it is safe for branches to raise exceptions or
+        produce side effects.
+    
+        Parameters
+        ----------
+        condition : object
+            The predicate to select a branch. May be a ``Delayed`` object, any
+            other dask collection, or a plain literal. Its truthiness selects
+            the branch.
+        if_true : object
+            The branch to evaluate and return if the condition is truthy. May
+            be a ``Delayed`` object, any other dask collection, or a plain
+            literal.
+        if_false : object
+            The branch to evaluate and return if the condition is falsy.
+        name : str, optional
+            The key to use for the result in the task graph. Defaults to a
+            hash of the inputs.
+        pure : bool, optional
+            Whether the inputs are hashed to produce a deterministic key.
+            Defaults to the global ``delayed_pure`` setting.
+    
+        Returns
+        -------
+        Delayed
+            A Delayed object that evaluates to the result of the selected
+            branch.
+    
+        Notes
+        -----
+        Conditional execution requires a scheduler that supports dynamic
+        branch resolution. The synchronous (``sync``) and threaded
+        (``threads``) schedulers support this; other schedulers raise an
+        error.
+    
+        Examples
+        --------
+        >>> from dask.delayed import cond, delayed
+        >>> @delayed
+        ... def check(x):
+        ...     return x > 0
+        >>> @delayed
+        ... def expensive_fallback(x):
+        ...     return x * 100
+        >>> @delayed
+        ... def cheap(x):
+        ...     return x
+        >>> result = cond(check(1), cheap(1), expensive_fallback(1))
+        >>> result.compute()
+        1
+        """
+    if name is None:
+        name = f'cond-{tokenize(condition, if_true, if_false, pure=pure)}'
+    condition_key, condition_tasks, condition_cols = _unpack_cond_arg(
+        condition, f'{name}-condition'
+    )
+    true_key, true_tasks, true_cols = _unpack_cond_arg(
+        if_true, f'{name}-if-true'
+    )
+    false_key, false_tasks, false_cols = _unpack_cond_arg(
+        if_false, f'{name}-if-false'
+    )
+    layer = {
+        name: Conditional(
+            name, TaskRef(condition_key), TaskRef(true_key), TaskRef(false_key)
+        ),
+        **condition_tasks,
+        **true_tasks,
+        **false_tasks,
+    }
+    collections = list(concat([condition_cols, true_cols, false_cols]))
+    graph = HighLevelGraph.from_collections(name, layer, dependencies=collections)
+    return Delayed(name, graph)
 
 
 def _swap(method, self, other):

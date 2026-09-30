@@ -117,7 +117,7 @@ from functools import partial
 from queue import Empty, Queue
 
 from dask import config
-from dask._task_spec import DataNode, convert_legacy_graph
+from dask._task_spec import Conditional, DataNode, convert_legacy_graph
 from dask.callbacks import local_callbacks, unpack_callbacks
 from dask.core import flatten, get_dependencies
 from dask.order import order
@@ -170,21 +170,88 @@ def start_state_from_dask(dsk, cache=None, sortkey=None, keys=None):
     if keys is None:
         keys = list(set(dsk) - set(cache))
     dsk = convert_legacy_graph(dsk, all_keys=set(dsk) | set(cache))
-    stack = list(keys)
-    dependencies = defaultdict(set)
-    dependents = defaultdict(set)
-    waiting = defaultdict(set)
-    waiting_data = defaultdict(set)
-    ready_set = set()
-    seen = set()
+    state = {
+        "dependencies": {},
+        "dependents": {},
+        "waiting": {},
+        "waiting_data": {},
+        "cache": cache,
+        "ready": [],
+        "running": set(),
+        "finished": set(),
+        "released": set(),
+    }
+
+    _discover_tasks(dsk, list(keys), state)
+    state["ready"].sort(key=sortkey, reverse=True)
+
+    return state
+
+
+def _ready_task(dsk, key, state, newly_ready=None):
+    """Mark a task as ready to run, resolving Conditional tasks dynamically.
+
+    A Conditional task whose condition has been computed does not become
+    ready directly. Instead, the selected branch is registered as a dynamic
+    dependency and its subgraph is discovered, so that only tasks of the
+    selected branch are ever scheduled.
+    """
+    if key in state["finished"] or key in state["running"]:
+        return
+    task = dsk.get(key, None)
+    if isinstance(task, Conditional):
+        dependencies = state["dependencies"][key]
+        branch = task.select(state["cache"][task.condition.key]).key
+        if branch not in dependencies:
+            # Resolve the dynamic dependency on the selected branch
+            dependencies.add(branch)
+            state["dependents"].setdefault(branch, set()).add(key)
+            state["waiting_data"].setdefault(branch, set()).add(key)
+            if branch not in state["cache"]:
+                state["waiting"][key] = {branch}
+                _discover_tasks(dsk, [branch], state)
+                return
+    if newly_ready is not None:
+        if key in newly_ready:
+            return
+        newly_ready.add(key)
+    state["ready"].append(key)
+
+
+def _discover_tasks(dsk, stack, state):
+    """Register all tasks reachable from ``stack`` in the scheduler state.
+
+    This walks the graph downwards from the keys in ``stack`` and registers
+    dependency relationships for every task encountered. Conditional tasks
+    are only followed into their static dependency (the condition); the
+    selected branch is discovered dynamically once the condition has been
+    computed (see ``_ready_task``).
+
+    Tasks whose results were previously released (e.g. because all their
+    then-known dependents had finished) are re-registered so that they are
+    recomputed.
+    """
+    cache = state["cache"]
+    dependencies = state["dependencies"]
+    dependents = state["dependents"]
+    waiting = state["waiting"]
+    waiting_data = state["waiting_data"]
+    released = state["released"]
+    finished = state["finished"]
+    newly_ready = set()
     while stack:
         key = stack.pop()
-        if key in seen:
+        if key in released:
+            # The task ran before but its result has been released in the
+            # meantime. Resurrect it so that it is recomputed.
+            released.discard(key)
+            finished.discard(key)
+        elif key in dependencies:
+            # Already registered
             continue
-        seen.add(key)
-        dependents[key]
-        waiting_data[key]
-        dependencies[key]
+        dependencies.setdefault(key, set())
+        dependents.setdefault(key, set())
+        waiting_data.setdefault(key, set())
         task = dsk.get(key, None)
         if task is None:
             if dependents[key] and not cache.get(key):
@@ -192,44 +259,27 @@ def start_state_from_dask(dsk, cache=None, sortkey=None, keys=None):
                     f"Missing dependency {key} for dependents {dependents[key]}"
                 )
             continue
-        elif isinstance(task, DataNode):
+        if isinstance(task, DataNode):
             cache[key] = task()
-            dependencies[key]
             for d in dependents[key]:
                 if d in waiting:
                     waiting[d].remove(key)
                     if not waiting[d]:
                         del waiting[d]
-                        ready_set.add(d)
+                        _ready_task(dsk, d, state, newly_ready)
                 else:
-                    ready_set.add(d)
+                    _ready_task(dsk, d, state, newly_ready)
+            continue
+        _wait = task.dependencies - set(cache)
+        if not _wait:
+            _ready_task(dsk, key, state, newly_ready)
         else:
-            _wait = task.dependencies - set(cache)
-            if not _wait:
-                ready_set.add(key)
-            else:
-                waiting[key] = set(_wait)
-            for dep in task.dependencies:
-                dependencies[key].add(dep)
-                dependents[dep].add(key)
-                waiting_data[dep].add(key)
-                stack.append(dep)
-
-    ready = sorted(ready_set, key=sortkey, reverse=True)
-
-    state = {
-        "dependencies": dict(dependencies),
-        "dependents": dict(dependents),
-        "waiting": dict(waiting),
-        "waiting_data": dict(waiting_data),
-        "cache": cache,
-        "ready": ready,
-        "running": set(),
-        "finished": set(),
-        "released": set(),
-    }
-
-    return state
+            waiting[key] = set(_wait)
+        for dep in task.dependencies:
+            dependencies[key].add(dep)
+            dependents.setdefault(dep, set()).add(key)
+            waiting_data.setdefault(dep, set()).add(key)
+            stack.append(dep)
 
 
 """
@@ -296,11 +346,15 @@ def finish_task(
     Mutates.  This should run atomically (with a lock).
     """
     for dep in sorted(state["dependents"][key], key=sortkey, reverse=True):
-        s = state["waiting"][dep]
+        s = state["waiting"].get(dep)
+        if s is None:
+            # The dependent has already finished. This can happen when a
+            # released task is recomputed on demand (see _discover_tasks).
+            continue
         s.remove(key)
         if not s:
             del state["waiting"][dep]
-            state["ready"].append(dep)
+            _ready_task(dsk, dep, state)
 
     for dep in state["dependencies"][key]:
         if dep in state["waiting_data"]:

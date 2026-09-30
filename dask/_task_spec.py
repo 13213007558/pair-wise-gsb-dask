@@ -396,6 +396,17 @@ class GraphNode:
         return self._dependencies
 
     @property
+    def all_dependencies(self) -> frozenset:
+        # All dependencies this task may require at runtime.
+        #
+        # For most tasks this is identical to ``dependencies``. Tasks with
+        # dynamically resolved dependencies (e.g. Conditional) only expose
+        # their static dependencies via ``dependencies`` but must expose
+        # every potential dependency here so that graph analysis (culling,
+        # ordering) keeps the full graph intact.
+        return self.dependencies
+
+    @property
     def block_fusion(self) -> bool:
         return False
 
@@ -615,6 +626,119 @@ class DataNode(GraphNode):
 
     def __iter__(self):
         return iter(self.value)
+
+
+class Conditional(GraphNode):
+    """A task that selects one of two branches based on a condition.
+
+    The condition is the only static dependency. Which of the two branches
+    is required is only known once the condition has been evaluated, so the
+    dependency on the selected branch is resolved dynamically at runtime by
+    schedulers that support conditional execution (currently the local
+    synchronous and threaded schedulers, see dask.local).
+
+    Schedulers without support for dynamic dependencies will only schedule
+    the condition and fail with a clear error when this task is executed.
+    """
+
+    condition: TaskRef
+    then: TaskRef
+    otherwise: TaskRef
+
+    __slots__ = tuple(__annotations__)
+
+    def __init__(
+        self,
+        key: KeyType,
+        condition: TaskRef | KeyType,
+        then: TaskRef | KeyType,
+        otherwise: TaskRef | KeyType,
+    ):
+        self.key = key
+        self.condition = self._validate_ref(condition, 'condition')
+        self.then = self._validate_ref(then, 'then')
+        self.otherwise = self._validate_ref(otherwise, 'otherwise')
+        self._dependencies = frozenset((self.condition.key,))
+
+    @staticmethod
+    def _validate_ref(value, name):
+        if isinstance(value, TaskRef):
+            return value
+        if isinstance(value, GraphNode):
+            raise TypeError(
+                f'A Conditional {name} must reference a task by key, got {value!r}'
+            )
+        return TaskRef(value)
+
+    @property
+    def all_dependencies(self) -> frozenset:
+        return frozenset(
+            (self.condition.key, self.then.key, self.otherwise.key)
+        )
+
+    @property
+    def block_fusion(self) -> bool:
+        # Fusing a conditional with its branches would execute both sides
+        return True
+
+    def select(self, condition_value) -> TaskRef:
+        # Return the reference of the branch to execute
+        return self.then if condition_value else self.otherwise
+
+    def __call__(self, values=()):
+        self._verify_values(values)
+        branch = self.select(values[self.condition.key])
+        try:
+            return values[branch.key]
+        except KeyError:
+            raise RuntimeError(
+                'Conditional tasks require a scheduler that supports '
+                'dynamic branch resolution, e.g. the synchronous (sync) or '
+                'threaded (threads) scheduler. The scheduler in use does '
+                'not support conditional execution.'
+            ) from None
+
+    def copy(self):
+        return Conditional(
+            self.key, self.condition, self.then, self.otherwise
+        )
+
+    def __reduce__(self):
+        return (
+            Conditional,
+            (self.key, self.condition, self.then, self.otherwise),
+        )
+
+    def __dask_tokenize__(self):
+        from dask.base import tokenize
+
+        return (
+            type(self).__name__,
+            tokenize(self.condition),
+            tokenize(self.then),
+            tokenize(self.otherwise),
+        )
+
+    def __repr__(self):
+        return (
+            f'Conditional({self.key!r} if {self.condition!r} '
+            f'then {self.then!r} else {self.otherwise!r})'
+        )
+
+    def substitute(
+        self, subs: dict[KeyType, KeyType | GraphNode], key: KeyType | None = None
+    ) -> GraphNode:
+        condition = self.condition.substitute(subs)
+        then = self.then.substitute(subs)
+        otherwise = self.otherwise.substitute(subs)
+        if (
+            condition is self.condition
+            and then is self.then
+            and otherwise is self.otherwise
+            and (key is None or key == self.key)
+        ):
+            return self
+        return Conditional(key or self.key, condition, then, otherwise)
 
 
 def _get_dependencies(obj: object) -> set | frozenset:
@@ -1017,7 +1141,7 @@ class DependenciesMapping(MutableMapping):
         else:
             v = self.dsk[key]
             try:
-                deps = v.dependencies
+                deps = v.all_dependencies
             except AttributeError:
                 from dask.core import get_dependencies
 
@@ -1206,7 +1330,7 @@ def cull(
             continue
         sadd(k)
         dsk2[k] = v = dsk[k]
-        wupdate(v.dependencies)
+        wupdate(v.all_dependencies)
     return dsk2
 
 

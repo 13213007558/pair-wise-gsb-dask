@@ -15,6 +15,7 @@ from warnings import warn
 import cloudpickle
 
 from dask import config
+from dask._task_spec import Conditional
 from dask.local import MultiprocessingPoolExecutor, get_async, reraise
 from dask.optimization import cull, fuse
 from dask.system import CPU_COUNT
@@ -182,6 +183,15 @@ def get(
         Defaults to 6 as some batching is helpful.
         If -1, will be computed to evenly divide ready work across workers.
     """
+    if hasattr(dsk, "__dask_graph__"):
+        dsk = dsk.__dask_graph__()
+    dsk = ensure_dict(dsk)
+    if any(isinstance(task, Conditional) for task in dsk.values()):
+        raise NotImplementedError(
+            "The multiprocessing scheduler does not support conditional "
+            "tasks (dask.delayed.cond). Please use the synchronous ('sync') "
+            "or threaded ('threads') scheduler instead."
+        )
     chunksize = chunksize or config.get("chunksize", 6)
     pool = pool or config.get("pool", None)
     initializer = initializer or config.get("multiprocessing.initializer", None)
@@ -213,10 +223,6 @@ def get(
             pool = MultiprocessingPoolExecutor(pool)
         cleanup = False
 
-    if hasattr(dsk, "__dask_graph__"):
-        dsk = dsk.__dask_graph__()
-
-    dsk = ensure_dict(dsk)
     dsk2, dependencies = cull(dsk, keys)
     if optimize_graph:
         dsk3, dependencies = fuse(dsk2, keys, dependencies)

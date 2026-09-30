@@ -178,7 +178,7 @@ class Layer(Graph):
 
             out = cull(dict(self), keys)
             return MaterializedLayer(out, annotations=self.annotations), {
-                k: set(v.dependencies) for k, v in out.items()
+                k: set(v.all_dependencies) for k, v in out.items()
             }
 
     def get_dependencies(self, key: Key, all_hlg_keys: Collection[Key]) -> set:
