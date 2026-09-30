@@ -14,6 +14,10 @@ The ``dask.delayed`` interface consists of one function, ``delayed``:
 
    Wraps objects. Used to create ``Delayed`` proxies directly.
 
+- ``if_then_else`` selects a delayed branch
+
+   Evaluates a delayed condition, then schedules only the selected branch.
+
 ``Delayed`` objects can be thought of as representing a key in the dask task
 graph. A ``Delayed`` supports *most* python operations, each of which creates
 another ``Delayed`` representing the result:
@@ -30,19 +34,21 @@ Operations that aren't supported include:
 - Iteration. (``for i in a: ...``)
 - Use as a predicate (``if a: ...``)
 
-The last two points in particular mean that ``Delayed`` objects cannot be used for
-control flow, meaning that no ``Delayed`` can appear in a loop or if statement.
-In other words you can't iterate over a ``Delayed`` object, or use it as part of
-a condition in an if statement, but ``Delayed`` object can be used in a body of a loop
-or if statement (i.e. the example above is fine, but if ``data`` was a ``Delayed``
-object it wouldn't be).
+The last two points in particular mean that ``Delayed`` objects cannot be used
+for ordinary Python control flow. In other words you can't iterate over a
+``Delayed`` object, or use it directly in an ``if`` statement. Use
+``if_then_else`` for an ``if`` whose condition or branches are delayed.
+``Delayed`` objects can otherwise be used in the body of a loop or ``if``
+statement.
 Even with this limitation, many workflows can easily be parallelized.
 
 .. currentmodule:: dask.delayed
 
 .. autosummary::
    delayed
+   if_then_else
    Delayed
 
 .. autofunction:: delayed
+.. autofunction:: if_then_else
 .. autoclass:: Delayed

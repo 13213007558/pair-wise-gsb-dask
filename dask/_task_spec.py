@@ -838,6 +838,81 @@ class Task(GraphNode):
             )
 
 
+class Conditional(GraphNode):
+    condition: TaskRef
+    true_branch: TaskRef
+    false_branch: TaskRef
+
+    __slots__ = tuple(__annotations__)
+
+    def __init__(
+        self,
+        key: KeyType,
+        condition: TaskRef,
+        true_branch: TaskRef,
+        false_branch: TaskRef,
+    ):
+        self.key = key
+        self.condition = condition
+        self.true_branch = true_branch
+        self.false_branch = false_branch
+        self._dependencies = frozenset((condition.key,))
+
+    @property
+    def block_fusion(self) -> bool:
+        return True
+
+    def copy(self) -> Conditional:
+        return Conditional(
+            self.key,
+            self.condition,
+            self.true_branch,
+            self.false_branch,
+        )
+
+    def selected_key(self, condition: object) -> KeyType:
+        return self.true_branch.key if condition else self.false_branch.key
+
+    def __call__(self, values=()):
+        raise RuntimeError(
+            "Conditional nodes must be expanded by a scheduler that supports "
+            "delayed conditionals"
+        )
+
+    def substitute(
+        self, subs: dict[KeyType, KeyType | GraphNode], key: KeyType | None = None
+    ) -> Conditional:
+        condition = self.condition.substitute(subs)
+        true_branch = self.true_branch.substitute(subs)
+        false_branch = self.false_branch.substitute(subs)
+        if not isinstance(condition, TaskRef) or not isinstance(
+            true_branch, TaskRef
+        ) or not isinstance(false_branch, TaskRef):
+            raise TypeError("Conditional branches must reference graph keys")
+
+        new_key = key or self.key
+        if (
+            new_key == self.key
+            and condition == self.condition
+            and true_branch == self.true_branch
+            and false_branch == self.false_branch
+        ):
+            return self
+        return Conditional(new_key, condition, true_branch, false_branch)
+
+    def __reduce__(self):
+        return (
+            Conditional,
+            (self.key, self.condition, self.true_branch, self.false_branch),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"Conditional({self.key!r}, {self.condition!r}, "
+            f"{self.true_branch!r}, {self.false_branch!r})"
+        )
+
+
 class NestedContainer(Task, Iterable):
     constructor: Callable
     klass: type
@@ -1207,6 +1282,8 @@ def cull(
         sadd(k)
         dsk2[k] = v = dsk[k]
         wupdate(v.dependencies)
+        if isinstance(v, Conditional):
+            wupdate({v.true_branch.key, v.false_branch.key})
     return dsk2
 
 

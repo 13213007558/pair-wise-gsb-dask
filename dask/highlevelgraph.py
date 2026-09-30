@@ -22,7 +22,7 @@ import tlz as toolz
 
 import dask
 from dask import config
-from dask._task_spec import GraphNode
+from dask._task_spec import Conditional, GraphNode
 from dask.base import clone_key, flatten, is_dask_collection
 from dask.core import keys_in_tasks, reverse_dict
 from dask.tokenize import normalize_token, tokenize
@@ -177,8 +177,13 @@ class Layer(Graph):
             from dask._task_spec import cull
 
             out = cull(dict(self), keys)
+            deps = {}
+            for k, v in out.items():
+                deps[k] = set(v.dependencies)
+                if isinstance(v, Conditional):
+                    deps[k].update((v.true_branch.key, v.false_branch.key))
             return MaterializedLayer(out, annotations=self.annotations), {
-                k: set(v.dependencies) for k, v in out.items()
+                **deps,
             }
 
     def get_dependencies(self, key: Key, all_hlg_keys: Collection[Key]) -> set:

@@ -117,7 +117,7 @@ from functools import partial
 from queue import Empty, Queue
 
 from dask import config
-from dask._task_spec import DataNode, convert_legacy_graph
+from dask._task_spec import Alias, Conditional, DataNode, convert_legacy_graph
 from dask.callbacks import local_callbacks, unpack_callbacks
 from dask.core import flatten, get_dependencies
 from dask.order import order
@@ -214,6 +214,9 @@ def start_state_from_dask(dsk, cache=None, sortkey=None, keys=None):
                 dependents[dep].add(key)
                 waiting_data[dep].add(key)
                 stack.append(dep)
+            if isinstance(task, Conditional):
+                for branch_key in (task.true_branch.key, task.false_branch.key):
+                    waiting_data[branch_key].add(key)
 
     ready = sorted(ready_set, key=sortkey, reverse=True)
 
@@ -230,6 +233,87 @@ def start_state_from_dask(dsk, cache=None, sortkey=None, keys=None):
     }
 
     return state
+
+
+def _ensure_branch_key(dsk, key, state):
+    dependents = state["dependents"]
+    waiting = state["waiting"]
+    waiting_data = state["waiting_data"]
+    cache = state["cache"]
+    dependencies = state["dependencies"]
+    order = []
+    stack = [key]
+    seen = set()
+
+    while stack:
+        branch_key = stack.pop()
+        if branch_key in seen or branch_key in dependencies:
+            continue
+        seen.add(branch_key)
+
+        task = dsk.get(branch_key)
+        if task is None:
+            if branch_key in cache:
+                continue
+            raise ValueError(f"Missing dependency {branch_key}")
+
+        if not isinstance(task, DataNode):
+            order.append(branch_key)
+            stack.extend(task.dependencies)
+        else:
+            order.append(branch_key)
+
+    for branch_key in reversed(order):
+        if branch_key in dependencies:
+            continue
+
+        task = dsk[branch_key]
+        dependencies[branch_key] = set()
+        dependents.setdefault(branch_key, set())
+        waiting_data.setdefault(branch_key, set())
+
+        if isinstance(task, DataNode):
+            cache[branch_key] = task()
+            continue
+
+        if isinstance(task, Conditional):
+            for nested_branch_key in (task.true_branch.key, task.false_branch.key):
+                waiting_data.setdefault(nested_branch_key, set()).add(branch_key)
+
+        dependencies[branch_key].update(task.dependencies)
+        for dep in task.dependencies:
+            dependents.setdefault(dep, set()).add(branch_key)
+            waiting_data.setdefault(dep, set()).add(branch_key)
+
+        waiting_on = task.dependencies - set(cache)
+        if waiting_on:
+            waiting[branch_key] = set(waiting_on)
+        else:
+            state["ready"].append(branch_key)
+
+
+def _activate_conditional(dsk, key, state):
+    task = dsk[key]
+    if not isinstance(task, Conditional):
+        return
+
+    condition_key = task.condition.key
+    selected_key = task.selected_key(state["cache"][condition_key])
+    dsk[key] = Alias(key, target=selected_key)
+
+    for branch_key in (task.true_branch.key, task.false_branch.key):
+        state["waiting_data"].get(branch_key, set()).discard(key)
+
+    state["dependents"][condition_key].discard(key)
+    state["waiting_data"].get(condition_key, set()).discard(key)
+    _ensure_branch_key(dsk, selected_key, state)
+    state["dependencies"][key] = {selected_key}
+    state["dependents"][selected_key].add(key)
+    state["waiting_data"][selected_key].add(key)
+    if selected_key in state["cache"]:
+        state["ready"].append(key)
+    else:
+        state["waiting"][key] = {selected_key}
 
 
 """
@@ -393,6 +477,7 @@ def get_async(
     dumps=identity,
     loads=identity,
     chunksize=None,
+    supports_conditionals=False,
     **kwargs,
 ):
     """Asynchronous get function
@@ -456,6 +541,13 @@ def get_async(
     if not isinstance(dsk, Mapping):
         dsk = dsk.__dask_graph__()
     dsk = convert_legacy_graph(dsk)
+    if not supports_conditionals and any(
+        isinstance(task, Conditional) for task in dsk.values()
+    ):
+        raise NotImplementedError(
+            "Delayed conditionals are only supported by the local synchronous "
+            "and threaded schedulers"
+        )
     with local_callbacks(callbacks) as callbacks:
         _, _, pretask_cbs, posttask_cbs, _ = unpack_callbacks(callbacks)
         started_cbs = []
@@ -532,6 +624,18 @@ def get_async(
 
             # Main loop, wait on tasks to finish, insert new ones
             while state["waiting"] or state["ready"] or state["running"]:
+                ready_conditionals = [
+                    key for key in state["ready"] if isinstance(dsk[key], Conditional)
+                ]
+                while ready_conditionals:
+                    key = ready_conditionals.pop()
+                    state["ready"].remove(key)
+                    _activate_conditional(dsk, key, state)
+                    ready_conditionals.extend(
+                        key
+                        for key in state["ready"]
+                        if isinstance(dsk[key], Conditional)
+                    )
                 fire_tasks(chunksize)
                 for key, res_info, failed in queue_get(queue).result():
                     if failed:
@@ -590,6 +694,7 @@ def get_sync(dsk: Mapping, keys: Sequence[Key] | Key, **kwargs):
     Can be useful for debugging.
     """
     kwargs.pop("num_workers", None)  # if num_workers present, remove it
+    kwargs["supports_conditionals"] = True
     return get_async(
         synchronous_executor.submit,
         synchronous_executor._max_workers,
@@ -597,6 +702,9 @@ def get_sync(dsk: Mapping, keys: Sequence[Key] | Key, **kwargs):
         keys,
         **kwargs,
     )
+
+
+get_sync.supports_delayed_conditionals = True
 
 
 """ Adaptor for ``multiprocessing.Pool`` instances

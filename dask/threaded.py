@@ -120,6 +120,7 @@ def get(
         cache=cache,
         get_id=_thread_get_id,
         pack_exception=pack_exception,
+        supports_conditionals=True,
         **kwargs,
     )
 
@@ -133,3 +134,6 @@ def get(
                         p.shutdown()
 
     return results
+
+
+get.supports_delayed_conditionals = True

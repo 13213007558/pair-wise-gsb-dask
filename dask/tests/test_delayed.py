@@ -18,7 +18,7 @@ import dask.bag as db
 from dask import compute
 from dask._task_spec import Task
 from dask.base import collections_to_expr
-from dask.delayed import Delayed, delayed, to_task_dask
+from dask.delayed import Delayed, delayed, if_then_else, to_task_dask
 from dask.highlevelgraph import HighLevelGraph
 from dask.utils_test import inc
 
@@ -962,3 +962,155 @@ def test_p2p_as_delayed():
         )
 
     _test()
+
+
+@pytest.mark.parametrize(
+    "scheduler",
+    ["synchronous", "threads", dask.local.get_sync, dask.threaded.get],
+)
+@pytest.mark.parametrize("condition_value", [True, False])
+def test_if_then_else_only_executes_selected_branch(scheduler, condition_value):
+    calls = []
+
+    def record(name, result):
+        calls.append(name)
+        return result
+
+    def fail_if_called():
+        calls.append("failed")
+        raise AssertionError("unselected branch was executed")
+
+    condition = delayed(record)("condition", condition_value)
+    true_branch = delayed(record)("true", "true result")
+    false_branch = delayed(record)("false", "false result")
+    selected = if_then_else(condition, true_branch, false_branch)
+    not_selected = delayed(fail_if_called)()
+    result = if_then_else(
+        condition,
+        selected if condition_value else not_selected,
+        not_selected if condition_value else selected,
+    ).compute(scheduler=scheduler)
+
+    assert result == "true result" if condition_value else "false result"
+    assert calls == (
+        ["condition", "true"] if condition_value else ["condition", "false"]
+    )
+
+
+@pytest.mark.parametrize("scheduler", ["synchronous", "threads"])
+def test_if_then_else_shared_dependencies_run_once(scheduler):
+    calls = []
+
+    def record(value):
+        calls.append(value)
+        return value
+
+    shared = delayed(record)("shared")
+    true_branch = delayed(record)(("true", shared))
+    false_branch = delayed(record)(("false", shared))
+
+    result = if_then_else(
+        delayed(record)(True),
+        true_branch,
+        false_branch,
+    ).compute(scheduler=scheduler)
+
+    assert result == ("true", "shared")
+    assert calls.count("shared") == 1
+    assert "false" not in calls
+
+
+@pytest.mark.parametrize("scheduler", ["synchronous", "threads"])
+@pytest.mark.parametrize("condition_value", [True, False])
+def test_if_then_else_condition_can_feed_selected_branch(
+    scheduler, condition_value
+):
+    condition = delayed(lambda: condition_value)()
+    branch = delayed(lambda value: value)(condition)
+    result = if_then_else(condition, branch, branch).compute(scheduler=scheduler)
+
+    assert result is condition_value
+
+
+@pytest.mark.parametrize("scheduler", ["synchronous", "threads"])
+def test_nested_if_then_else_skips_unselected_nested_branch(scheduler):
+    calls = []
+
+    def record(name, result=None):
+        calls.append(name)
+        return result
+
+    def fail_if_called():
+        raise AssertionError("nested unselected branch was executed")
+
+    outer = delayed(record)("outer", True)
+    inner = delayed(record)("inner", False)
+    true_inner = delayed(record)("inner-true", "inner true")
+    false_inner = delayed(record)("inner-false", "inner false")
+    nested = if_then_else(inner, true_inner, false_inner)
+    result = if_then_else(
+        outer,
+        nested,
+        delayed(fail_if_called)(),
+    ).compute(scheduler=scheduler)
+
+    assert result == "inner false"
+    assert calls == ["outer", "inner", "inner-false"]
+
+
+@pytest.mark.parametrize("scheduler", ["synchronous", "threads"])
+def test_if_then_else_independent_output_still_executes_branch(scheduler):
+    calls = []
+
+    def record(name):
+        calls.append(name)
+        return name
+
+    true_branch = delayed(record)("true")
+    false_branch = delayed(record)("false")
+    selected = if_then_else(
+        delayed(True),
+        true_branch,
+        false_branch,
+    )
+
+    selected_result, false_result = dask.compute(
+        selected, false_branch, scheduler=scheduler
+    )
+
+    assert (selected_result, false_result) == ("true", "false")
+    assert set(calls) == {"true", "false"}
+
+
+def test_if_then_else_rejects_process_scheduler():
+    selected = if_then_else(
+        delayed(True),
+        delayed("true"),
+        delayed("false"),
+    )
+
+    with pytest.raises(NotImplementedError, match="synchronous.*threaded"):
+        selected.compute(scheduler="processes")
+
+
+def test_if_then_else_rejects_unsupported_custom_scheduler():
+    def unsupported_scheduler(dsk, keys, **kwargs):
+        raise AssertionError("conditional graph should not be scheduled")
+
+    selected = if_then_else(
+        delayed(True),
+        delayed("true"),
+        delayed("false"),
+    )
+
+    with pytest.raises(NotImplementedError, match="synchronous.*threaded"):
+        selected.compute(scheduler=unsupported_scheduler)
+
+
+def test_if_then_else_literal_branches_and_condition():
+    assert if_then_else(True, delayed("true"), "false").compute(
+        scheduler="synchronous"
+    ) == "true"
+    assert if_then_else(False, "true", delayed("false")).compute(
+        scheduler="synchronous"
+    ) == "false"

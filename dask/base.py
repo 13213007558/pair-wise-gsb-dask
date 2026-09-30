@@ -17,7 +17,7 @@ from tlz import merge
 
 from dask import config, local
 from dask._compatibility import EMSCRIPTEN
-from dask._task_spec import DataNode, Dict, List, Task, TaskRef
+from dask._task_spec import Conditional, DataNode, Dict, List, Task, TaskRef
 from dask.core import flatten
 from dask.core import get as simple_get
 from dask.system import CPU_COUNT
@@ -414,7 +414,44 @@ def compute_as_if_collection(cls, dsk, keys, scheduler=None, get=None, **kwargs)
     Allows for applying the same optimizations and default scheduler."""
     schedule = get_scheduler(scheduler=scheduler, cls=cls, get=get)
     dsk2 = optimization_function(cls)(dsk, keys, **kwargs)
+    _check_conditional_support(dsk2, schedule)
     return schedule(dsk2, keys, **kwargs)
+
+
+def _graph_contains_conditional(graph: Mapping) -> bool:
+    """Return whether a materialized graph contains a delayed conditional."""
+    if hasattr(graph, "to_dict"):
+        graph = graph.to_dict()
+
+    stack = []
+    stack.extend(graph.values())
+
+    while stack:
+        task = stack.pop()
+        if isinstance(task, Conditional):
+            return True
+        if isinstance(task, dict):
+            stack.extend(task.values())
+        elif isinstance(task, list):
+            stack.extend(task)
+        elif isinstance(task, tuple):
+            stack.extend(task[1:])
+    return False
+
+
+def _check_conditional_support(graph, scheduler) -> None:
+    scheduler_obj = getattr(scheduler, "__self__", scheduler)
+    if getattr(scheduler_obj, "supports_delayed_conditionals", False):
+        return
+
+    if not _graph_contains_conditional(graph):
+        return
+
+    raise NotImplementedError(
+        "Delayed conditionals are only supported by the local synchronous "
+        "and threaded schedulers. Use scheduler='synchronous' or "
+        "scheduler='threads'."
+    )
 
 
 def dont_optimize(dsk, keys, **kwargs):
@@ -765,6 +802,7 @@ def compute(
 
         expr = expr.optimize()
         keys = list(flatten(expr.__dask_keys__()))
+        _check_conditional_support(expr.__dask_graph__(), schedule)
 
         results = schedule(expr, keys, **kwargs)
 
@@ -1078,6 +1116,8 @@ def persist(*args, traverse=True, optimize_graph=True, scheduler=None, **kwargs)
         return args
 
     schedule = get_scheduler(scheduler=scheduler, collections=collections)
+    for collection in collections:
+        _check_conditional_support(collection.__dask_graph__(), schedule)
 
     # Protocol: scheduler can provide its own persist method for async behavior.
     # For Client-like objects, get_scheduler returns client.get (a bound method),
@@ -1109,6 +1149,8 @@ def persist(*args, traverse=True, optimize_graph=True, scheduler=None, **kwargs)
             collection_exprs = [None] * len(collections)
     else:
         collection_exprs = [None] * len(collections)
+
+    _check_conditional_support(expr.__dask_graph__(), schedule)
 
     keys, postpersists = [], []
     for a, aexpr, akeys in zip(

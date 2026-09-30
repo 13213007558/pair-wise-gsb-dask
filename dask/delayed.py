@@ -14,6 +14,7 @@ from tlz import concat, curry, merge
 from dask import base, config, utils
 from dask._expr import FinalizeCompute, ProhibitReuse, _ExprSequence
 from dask._task_spec import (
+    Conditional,
     DataNode,
     Dict,
     GraphNode,
@@ -45,7 +46,7 @@ from dask.utils import (
     unzip,
 )
 
-__all__ = ["Delayed", "delayed"]
+__all__ = ["Delayed", "delayed", "if_then_else"]
 
 
 DEFAULT_GET = named_schedulers.get("threads", named_schedulers["sync"])
@@ -645,6 +646,73 @@ def delayed(obj, name=None, pure=None, nout=None, traverse=True):
             task.key = name
         graph = HighLevelGraph.from_collections(name, layer, dependencies=collections)
         return Delayed(name, graph, nout)
+
+
+def if_then_else(
+    condition: Delayed | object,
+    true_branch: Delayed | object,
+    false_branch: Delayed | object,
+    pure: bool | None = None,
+) -> Delayed:
+    """Conditionally select a delayed result without executing both branches.
+
+    Unlike ``true_branch if condition else false_branch``, both ``condition``
+    and the selected branch remain lazy. The local synchronous and threaded
+    schedulers expand the selected branch only after ``condition`` has been
+    computed.
+
+    Parameters
+    ----------
+    condition : Delayed or object
+        A delayed truthy value, or an immediate Python object.
+    true_branch : Delayed or object
+        The result to select when ``condition`` is truthy.
+    false_branch : Delayed or object
+        The result to select when ``condition`` is falsy.
+    pure : bool, optional
+        Whether the resulting key should be deterministic. By default this
+        follows the ``delayed_pure`` configuration.
+
+    Returns
+    -------
+    Delayed
+        The selected branch's delayed result.
+
+    Examples
+    --------
+    >>> import dask
+    >>> condition = dask.delayed(True)
+    >>> result = dask.delayed.if_then_else(
+    ...     condition,
+    ...     dask.delayed("yes"),
+    ...     dask.delayed("no"),
+    ... )
+    >>> result.compute(scheduler="synchronous")
+    'yes'
+    """
+    if not isinstance(condition, Delayed):
+        condition = delayed(condition, pure=True)
+    if not isinstance(true_branch, Delayed):
+        true_branch = delayed(true_branch, pure=True)
+    if not isinstance(false_branch, Delayed):
+        false_branch = delayed(false_branch, pure=True)
+
+    name = f"if-then-else-{tokenize(condition, true_branch, false_branch, pure=pure)}"
+    task = Conditional(
+        name,
+        TaskRef(condition.key),
+        TaskRef(true_branch.key),
+        TaskRef(false_branch.key),
+    )
+    graph = HighLevelGraph.from_collections(
+        name,
+        {name: task},
+        dependencies=(condition, true_branch, false_branch),
+    )
+    return Delayed(name, graph)
+
+
+delayed.if_then_else = if_then_else
 
 
 def _swap(method, self, other):
